@@ -56,6 +56,7 @@ Must be valid JSON object with:
 *   If an attendee is missing `_id`, generate one.
 *   If `relationship` is missing, assign it per §3.1.
 *   `category` must be overwritten/reassigned to the priority value derived from `relationship` (see §3.2). Treat `category` as integer.
+*   For generation, attendees with `category: 1` are assigned as Bride and Groom if available.
 *   `VIP` attendees may optionally be excluded during fallback generation (recommended).
 
 ### 1.2 `seating_arrangement.json` (primary load/save)
@@ -150,6 +151,7 @@ Define a constant ordered list:
 
 *   `category` is always an integer equal to `RELATIONSHIPS.index(relationship)`.
 *   Lower category means **higher priority**.
+*   For Bride and Groom, `category` is set to 1.
 
 ### 3.3 Guaranteed uniqueness for Bride and Groom
 
@@ -336,14 +338,16 @@ On attendee drop (after overlap target is detected):
   - **Strict max enforcement**, **soft min enforcement (warn only)**.
 
 
-### 7.6 Prevent event-binding glitches (foolproof requirement)
+### 7.6 Legend Interactions
 
-Implementations must avoid “drag state lost” bugs:
+*   The legend displays table names and attendee lists for visibility.
+*   Table rectangles in the legend can be dragged vertically to reposition legend entries for better readability.
+*   Attendee rectangles in the legend can be dragged and dropped onto table circles on the canvas to reassign attendees to those tables, following the overlap rule (§7.3).
 
-*   Ensure event handlers do not conflict (e.g., attendee handlers should not trigger table handlers).
-*   Use event propagation control (e.g., return/stop propagation).
-*   Do not use shared mutable drag state across multiple simultaneous handlers without safeguards.
-*   Always compute drop using the actual attendee item position, not mouse position.
+### 7.7 Search Functionality
+
+*   A search bar allows real-time filtering of attendee names.
+*   Matching alphabets in attendee names are highlighted in yellow during typing.
 
 ***
 
@@ -454,12 +458,15 @@ On startup:
 Planner:
 
 *   [ ] Load `seating_arrangement.json` else fallback generate from `attendees.json`.
-*   [ ] Normalize attendees: ensure `_id`, ensure single Bride & Groom, recompute category.
+*   [ ] Normalize attendees: ensure `_id`, ensure single Bride & Groom from category 1, recompute category.
 *   [ ] Render room (black background), tables, attendee circles, attendee names.
 *   [ ] Show `(count)` next to each table name.
 *   [ ] Scrollbars: horizontal + vertical.
 *   [ ] Drag tables (except special); persist updated positions.
 *   [ ] Drag attendees; reassign only if attendee circle overlaps table circle.
+*   [ ] Drag legend table entries to reposition for visibility.
+*   [ ] Drag legend attendee rectangles to reassign attendees to tables.
+*   [ ] Realtime search with highlighting of matching alphabets in attendee names.
 *   [ ] Reset Layout: deterministic, below special table, no overlap.
 *   [ ] Save JSON + CSV on close with atomic save.
 *   [ ] Enforce table capacity constraints: normal tables must stay within min=5 and max=10 (max strict; min warn or strict per policy).

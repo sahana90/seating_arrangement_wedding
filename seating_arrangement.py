@@ -332,16 +332,21 @@ class SeatingModel:
             ensure_attendee_id(a)
             normalize_plus_one(a)
             normalize_food_allergy(a)
-        random.shuffle(raw)
-        bride = raw.pop()
-        groom = raw.pop() if raw else random.choice([bride])
+        # Find bride and groom based on category 1
+        category_1_attendees = [a for a in raw if a.get("category") == 1]
+        if len(category_1_attendees) < 2:
+            raise ValueError("attendees.json must contain at least 2 attendees with category 1 for bride and groom")
+        bride = category_1_attendees[0]
+        groom = category_1_attendees[1]
         bride["relationship"] = "Bride"
         groom["relationship"] = "Groom"
+        # Remove bride and groom from raw list
+        raw = [a for a in raw if a not in category_1_attendees]
         for a in raw:
             if a.get("relationship") not in RELATIONSHIPS:
                 a["relationship"] = random.choice(RELATIONSHIPS[2:])
         for a in [bride, groom] + raw:
-            a["category"] = RELATIONSHIPS.index(a["relationship"])
+            a["category"] = 1 if a["relationship"] in ("Bride", "Groom") else RELATIONSHIPS.index(a["relationship"])
             normalize_plus_one(a)
             normalize_food_allergy(a)
         # Group by relationship (except Bride/Groom)
@@ -415,6 +420,8 @@ class PlannerCanvas(tk.Canvas):
         self.model = model
         self.drag = None
         self.attendee_items = {}
+        self.search_string = ""
+        self.legend_positions = {}  # table -> (x, y)
         self.draw()
 
     def m2px(self, v):
@@ -581,6 +588,46 @@ class PlannerCanvas(tk.Canvas):
         rgb = blend_rgb(CANVAS_BG_RGB, fg, alpha)
         return rgb_to_hex(rgb)
 
+    def draw_highlighted_text(self, x, y, text, font, fill, highlight_fill, tags):
+        """Draw text with highlighting for search string. Returns list of text ids."""
+        ids = []
+        if not self.search_string:
+            id_ = self.create_text(x, y, text=text, fill=fill, font=font, tags=tags, anchor="w")
+            ids.append(id_)
+            return ids
+        search_lower = self.search_string.lower()
+        text_lower = text.lower()
+        start = text_lower.find(search_lower)
+        if start == -1:
+            id_ = self.create_text(x, y, text=text, fill=fill, font=font, tags=tags, anchor="w")
+            ids.append(id_)
+            return ids
+        end = start + len(self.search_string)
+        # Draw parts
+        current_x = x
+        # Before match
+        if start > 0:
+            before = text[:start]
+            id_ = self.create_text(current_x, y, text=before, fill=fill, font=font, tags=tags, anchor="w")
+            ids.append(id_)
+            current_x += self.font_measure(before, font)
+        # Match
+        match = text[start:end]
+        id_ = self.create_text(current_x, y, text=match, fill=highlight_fill, font=font, tags=tags, anchor="w")
+        ids.append(id_)
+        current_x += self.font_measure(match, font)
+        # After match
+        if end < len(text):
+            after = text[end:]
+            id_ = self.create_text(current_x, y, text=after, fill=fill, font=font, tags=tags, anchor="w")
+            ids.append(id_)
+        return ids
+
+    def font_measure(self, text, font):
+        """Approximate width of text in pixels. Since canvas doesn't have measure, use len * 8 as rough estimate."""
+        # For Arial 8, approx 6-7 px per char
+        return len(text) * 7
+
     def draw(self):
         self.delete("all")
         self.attendee_items.clear()
@@ -606,31 +653,47 @@ class PlannerCanvas(tk.Canvas):
         sorted_tables = sorted(self.model.tables.keys())
         for idx, table in enumerate(sorted_tables):
             guests = self.model.tables.get(table, [])
-            base_y = legend_y + (idx*5 + 1) * line_h
+            default_x = legend_x
+            default_y = legend_y + (idx*5 + 1) * line_h
+            base_x, base_y = self.legend_positions.get(table, (default_x, default_y))
             rep = guests[0] if guests else None
             header_color = self.attendee_color(rep) if rep else "#666666"
-            self.create_rectangle(
-                legend_x, base_y, legend_x + 14, base_y + 14,
-                fill=header_color, outline="#ffffff", width=1
+            rect_id = self.create_rectangle(
+                base_x, base_y, base_x + 14, base_y + 14,
+                fill=header_color, outline="#ffffff", width=1,
+                tags=(f"legend_group:{table}", f"legend_table:{table}")
             )
             self.create_text(
-                legend_x + 22, base_y + 7,
+                base_x + 22, base_y + 7,
                 text=f"{table}",
-                fill="#ffffff", font=("Arial", 9), anchor="w"
+                fill="#ffffff", font=("Arial", 9), anchor="w",
+                tags=(f"legend_group:{table}",)
             )
             for j, a in enumerate(guests[:8]):
                 c = self.attendee_color(a)
                 y = base_y + 16 + j * 14
-                self.create_rectangle(
-                    legend_x + 22, y - 2,
-                    legend_x + 34, y + 10,
-                    fill=c, outline="#ffffff", width=1
+                oval_id = self.create_rectangle(
+                    base_x + 22, y - 2,
+                    base_x + 34, y + 10,
+                    fill=c, outline="#ffffff", width=1,
+                    tags=(f"legend_group:{table}", f"legend_attendee:{table}:{ensure_attendee_id(a)}")
                 )
                 self.create_text(
-                    legend_x + 40, y + 4,
+                    base_x + 40, y + 4,
                     text=a.get("name", ""),
-                    fill="#ffffff", font=("Arial", 7), anchor="w"
+                    fill="#ffffff", font=("Arial", 7), anchor="w",
+                    tags=(f"legend_group:{table}",)
                 )
+                # Bind drag for legend attendee
+                self.tag_bind(f"legend_attendee:{table}:{ensure_attendee_id(a)}", "<ButtonPress-1>",
+                              lambda e, t=table, aid=ensure_attendee_id(a): self.start_legend_attendee_drag(e, t, aid))
+                self.tag_bind(f"legend_attendee:{table}:{ensure_attendee_id(a)}", "<B1-Motion>", self.drag_legend_attendee)
+                self.tag_bind(f"legend_attendee:{table}:{ensure_attendee_id(a)}", "<ButtonRelease-1>", self.end_legend_attendee_drag)
+            # Bind drag for legend table
+            self.tag_bind(f"legend_table:{table}", "<ButtonPress-1>",
+                          lambda e, t=table: self.start_legend_table_drag(e, t))
+            self.tag_bind(f"legend_table:{table}", "<B1-Motion>", self.drag_legend_table)
+            self.tag_bind(f"legend_table:{table}", "<ButtonRelease-1>", self.end_legend_table_drag)
         for table, guests in self.model.tables.items():
             tx, ty = self.model.table_positions.get(table, (ROOM_L / 2, ROOM_H / 2))
             px, py = self.m2px(tx), self.m2px(ty)
@@ -702,14 +765,15 @@ class PlannerCanvas(tk.Canvas):
                     fill=color, outline="#ffffff", width=1,
                     tags=(group_tag, f"attendee:{aid}", "attendee")
                 )
-                text_id = self.create_text(
+                text_ids = self.draw_highlighted_text(
                     gx, gy + 18,
-                    text=g.get("name", ""),
-                    fill="#ffffff",
-                    font=("Arial", 8),
-                    tags=(group_tag, f"attendee:{aid}", "attendee_label")
+                    g.get("name", ""),
+                    ("Arial", 8),
+                    "#ffffff",
+                    "#ffff00",
+                    (group_tag, f"attendee:{aid}", "attendee_label")
                 )
-                self.attendee_items[aid] = (oval_id, text_id)
+                self.attendee_items[aid] = (oval_id, text_ids)
                 # Draw plus-ones for this main invitee
                 plus_ones = g.get("plus_one", [])
                 n_plus = len(plus_ones)
@@ -727,14 +791,15 @@ class PlannerCanvas(tk.Canvas):
                         fill=self.attendee_color(p), outline="#ffffff", width=1,
                         tags=(group_tag, f"attendee:{pid}", "attendee", "plusone")
                     )
-                    text_id_p = self.create_text(
+                    text_ids_p = self.draw_highlighted_text(
                         pgx, pgy + 10,
-                        text=p.get("name", ""),
-                        fill="#ffffff",
-                        font=("Arial", 7),
-                        tags=(group_tag, f"attendee:{pid}", "attendee_label", "plusone_label")
+                        p.get("name", ""),
+                        ("Arial", 7),
+                        "#ffffff",
+                        "#ffff00",
+                        (group_tag, f"attendee:{pid}", "attendee_label", "plusone_label")
                     )
-                    self.attendee_items[pid] = (oval_id_p, text_id_p)
+                    self.attendee_items[pid] = (oval_id_p, text_ids_p)
                     # Bind right-click for editing
                     self.tag_bind(f"attendee:{pid}", "<Button-3>", self.open_attendee_editor_from_event)
                 # Bindings for main invitee
@@ -781,6 +846,121 @@ class PlannerCanvas(tk.Canvas):
         self.drag = None
         return "break"
 
+    def start_legend_table_drag(self, e, table):
+        self.drag = {
+            "type": "legend_table",
+            "table": table,
+            "x": self.canvasx(e.x),
+            "y": self.canvasy(e.y)
+        }
+        return "break"
+
+    def drag_legend_table(self, e):
+        if not self.drag or self.drag.get("type") != "legend_table":
+            return "break"
+        x = self.canvasx(e.x)
+        y = self.canvasy(e.y)
+        dx = x - self.drag["x"]
+        dy = y - self.drag["y"]
+        # Removed: self.move(f"group:{self.drag['table']}", dx, dy)
+        self.drag["x"], self.drag["y"] = x, y
+        return "break"
+
+    def start_legend_attendee_drag(self, e, table, attendee_id):
+        self.drag = {
+            "type": "legend_attendee",
+            "table": table,
+            "attendee_id": attendee_id,
+            "x": self.canvasx(e.x),
+            "y": self.canvasy(e.y)
+        }
+        return "break"
+
+    def drag_legend_attendee(self, e):
+        if not self.drag or self.drag.get("type") != "legend_attendee":
+            return "break"
+        # Do nothing for visual feedback, since legend redraws
+        return "break"
+
+    def end_legend_attendee_drag(self, e):
+        drag_ctx = self.drag
+        self.drag = None
+        if not drag_ctx or drag_ctx.get("type") != "legend_attendee":
+            return "break"
+        old_table = drag_ctx["table"]
+        attendee_id = drag_ctx["attendee_id"]
+        # Find the attendee
+        attendee = None
+        for g in self.model.tables.get(old_table, []):
+            if g.get("_id") == attendee_id:
+                attendee = g
+                break
+        if not attendee:
+            return "break"
+        # Check if dropped on a table
+        x = self.canvasx(e.x)
+        y = self.canvasy(e.y)
+        best_table = None
+        best_dist = None
+        for table, (tx, ty) in self.model.table_positions.items():
+            if table == old_table:
+                continue
+            px, py = self.m2px(tx), self.m2px(ty)
+            dist = math.hypot(x - px, y - py)
+            if dist < (ATT_R_PX + TABLE_R_PX):
+                if best_dist is None or dist < best_dist:
+                    best_dist = dist
+                    best_table = table
+        if best_table:
+            # Move attendee to best_table
+            try:
+                self.model.tables[old_table].remove(attendee)
+            except ValueError:
+                self.model.tables[old_table] = [g for g in self.model.tables[old_table] if g.get("_id") != attendee_id]
+            projected = self.model.table_headcount(self.model.tables[best_table]) + attendee_headcount(attendee)
+            if projected <= SEATS_PER_TABLE:
+                self.model.tables[best_table].append(attendee)
+            else:
+                messagebox.showwarning(
+                    "Table Full",
+                    f"Cannot move attendee: '{best_table}' would exceed {SEATS_PER_TABLE} seats with +1s."
+                )
+                self.model.tables[old_table].append(attendee)
+        self.draw()
+        return "break"
+
+    def start_legend_table_drag(self, e, table):
+        self.drag = {
+            "type": "legend_table",
+            "table": table,
+            "x": self.canvasx(e.x),
+            "y": self.canvasy(e.y)
+        }
+        return "break"
+
+    def drag_legend_table(self, e):
+        if not self.drag or self.drag.get("type") != "legend_table":
+            return "break"
+        x = self.canvasx(e.x)
+        y = self.canvasy(e.y)
+        dx = x - self.drag["x"]
+        dy = y - self.drag["y"]
+        self.move(f"legend_group:{self.drag['table']}", dx, dy)
+        self.drag["x"], self.drag["y"] = x, y
+        return "break"
+
+    def end_legend_table_drag(self, e):
+        if not self.drag or self.drag.get("type") != "legend_table":
+            self.drag = None
+            return "break"
+        table = self.drag["table"]
+        x = self.canvasx(e.x)
+        y = self.canvasy(e.y)
+        # Update position
+        self.legend_positions[table] = (x - 7, y - 7)  # Adjust for the rect center
+        self.drag = None
+        return "break"
+
     def start_attendee_drag(self, e, table, attendee, attendee_id):
         self.drag = {
             "type": "attendee",
@@ -801,9 +981,10 @@ class PlannerCanvas(tk.Canvas):
         dy = y - self.drag["y"]
         attendee_id = self.drag["attendee_id"]
         if attendee_id in self.attendee_items:
-            oval_id, text_id = self.attendee_items[attendee_id]
+            oval_id, text_ids = self.attendee_items[attendee_id]
             self.move(oval_id, dx, dy)
-            self.move(text_id, dx, dy)
+            for tid in text_ids:
+                self.move(tid, dx, dy)
         self.drag["x"], self.drag["y"] = x, y
         return "break"
 
@@ -938,6 +1119,11 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         top = ttk.Frame(self)
         top.pack(fill="x")
+        ttk.Label(top, text="Search Attendees:").pack(side="left", padx=8, pady=8)
+        self.search_var = tk.StringVar()
+        self.search_entry = ttk.Entry(top, textvariable=self.search_var, width=20)
+        self.search_entry.pack(side="left", padx=8, pady=8)
+        self.search_var.trace("w", self.on_search_change)
         ttk.Button(top, text="Reset Layout", command=self.on_reset).pack(side="right", padx=8, pady=8)
         tabs = ttk.Notebook(self)
         tabs.pack(fill="both", expand=True)
@@ -955,6 +1141,10 @@ class App(tk.Tk):
         viewer = ViewerTab(tabs)
         tabs.add(planner_frame, text="Planner")
         tabs.add(viewer, text="Viewer")
+
+    def on_search_change(self, *args):
+        self.canvas.search_string = self.search_var.get().strip()
+        self.canvas.draw()
 
     def on_reset(self):
         self.model.reset_layout()
