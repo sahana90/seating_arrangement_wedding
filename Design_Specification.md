@@ -138,13 +138,13 @@ Columns (header required):
 Define a constant ordered list:
 
 *   `RELATIONSHIPS = [`
-    *   `"Bride"`,
-    *   `"Groom"`,
-    *   `"Immediate Family"`,
-    *   `"Extended Family"`,
-    *   `"Childhood Friends"`,
-    *   `"UniversityFriends"`,
-    *   `"Colleagues"`
+    *   `"Bride-1"`,
+    *   `"Groom-1"`,
+    *   `"Immediate Family-2"`,
+    *   `"Extended Family-3"`,
+    *   `"Childhood Friends-4"`,
+    *   `"UniversityFriends-5"`,
+    *   `"Colleagues-6"`
 *   `]`
 
 ### 3.2 Category assignment (must be deterministic)

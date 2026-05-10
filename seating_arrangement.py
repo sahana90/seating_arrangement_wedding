@@ -204,6 +204,48 @@ class SeatingModel:
             chunks.append(current)
         return chunks
 
+    def _assign_positions_to_missing_tables(self):
+        min_y = self._special_bottom_y_m()
+        others = [t for t in self.tables.keys() if t != SPECIAL_TABLE and t not in self.table_positions]
+        if not others:
+            return
+        cols = 4
+        x_spacing_m = 4.2
+        y_spacing_m = 2.6
+        cx = ROOM_L / 2.0
+        start_index = len([t for t in self.tables.keys() if t != SPECIAL_TABLE and t in self.table_positions])
+        for idx, t in enumerate(others, start=start_index):
+            row = idx // cols
+            col = idx % cols
+            x = cx + (col - (cols - 1) / 2) * x_spacing_m
+            y = min_y + row * y_spacing_m
+            x = clamp(x, 2.0, ROOM_L - 2.0)
+            y = clamp(y, min_y, ROOM_H - 2.0)
+            self.table_positions[t] = (x, y)
+
+    def _rebalance_overflow_tables(self) -> bool:
+        changed = False
+        table_indices = [int(name.split("Table ")[1]) for name in self.tables.keys() if name.startswith("Table ") and name.split("Table ")[1].isdigit()]
+        next_index = max(table_indices, default=0) + 1
+
+        for table_name in list(self.tables.keys()):
+            if table_name == SPECIAL_TABLE:
+                continue
+            guests = self.tables[table_name]
+            if self.table_headcount(guests) <= SEATS_PER_TABLE:
+                continue
+            chunks = self.split_group_by_capacity(guests, SEATS_PER_TABLE)
+            self.tables[table_name] = chunks[0]
+            for overflow_chunk in chunks[1:]:
+                while f"Table {next_index}" in self.tables:
+                    next_index += 1
+                self.tables[f"Table {next_index}"] = overflow_chunk
+                next_index += 1
+                changed = True
+        if changed:
+            self._assign_positions_to_missing_tables()
+        return changed
+
     def load_seating(self, path="seating_arrangement.json"):
         if not os.path.exists(path):
             return False
@@ -221,7 +263,11 @@ class SeatingModel:
             missing = [t for t in self.tables.keys() if t not in self.table_positions]
             if missing:
                 self.reset_layout()
-            self.enforce_table_capacity()
+            if self._rebalance_overflow_tables():
+                logging.info("Rebalanced overflowed tables from '%s' by creating new tables.", path)
+            if not self.enforce_table_capacity(show_dialog=False):
+                logging.error("Loaded seating file '%s' still has tables over capacity after rebalancing.", path)
+                return False
             return True
         except Exception as e:
             messagebox.showerror("Load error", f"Failed to load seating:\n{e}")
@@ -392,16 +438,19 @@ class SeatingModel:
             self.table_positions[t] = (x, y)
         self._ensure_non_special_tables_below_special()
 
-    def enforce_table_capacity(self):
+    def enforce_table_capacity(self, show_dialog=True):
         for t, guests in self.tables.items():
             if t != Config.SPECIAL_TABLE and self.table_headcount(guests) > Config.SEATS_PER_TABLE:
                 logging.error(f"Table '{t}' exceeds the maximum of {Config.SEATS_PER_TABLE} seats (including +1s).")
-                messagebox.showerror(
-                    "Table Capacity Exceeded",
-                    f"Table '{t}' has more than {Config.SEATS_PER_TABLE} seats when +1s are included.\n"
-                    "Please delete 'seating_arrangement.json' and restart the application."
-                )
-                raise RuntimeError("Table capacity exceeded.")
+                if show_dialog:
+                    messagebox.showerror(
+                        "Table Capacity Exceeded",
+                        f"Table '{t}' has more than {Config.SEATS_PER_TABLE} seats when +1s are included.\n"
+                        "Please delete or fix 'seating_arrangement.json' and restart the application."
+                    )
+                    raise RuntimeError("Table capacity exceeded.")
+                return False
+        return True
 
 # ======================================================
 # Planner Canvas
@@ -575,13 +624,18 @@ class PlannerCanvas(tk.Canvas):
         max_cat = max(1, len(RELATIONSHIPS) - 1)
         alpha = MIN_ALPHA + (cat / max_cat) * (MAX_ALPHA - MIN_ALPHA)
         alpha = clamp(alpha, MIN_ALPHA, MAX_ALPHA)
-        rel = attendee.get("relationship", "Colleagues")
-        if rel == "Bride":
+        side = str(attendee.get("side", "")).strip().lower()
+        if side == "bride":
             fg = (255, 0, 0)
-        elif rel == "Groom":
+        elif side == "groom":
             fg = (0, 110, 255)
         else:
-            if rel in ("Immediate Family", "Extended Family"):
+            rel = attendee.get("relationship", "Colleagues")
+            if rel == "Bride":
+                fg = (255, 0, 0)
+            elif rel == "Groom":
+                fg = (0, 110, 255)
+            elif rel in ("Immediate Family", "Extended Family"):
                 fg = (255, 40, 40)
             else:
                 fg = (40, 140, 255)
@@ -784,7 +838,12 @@ class PlannerCanvas(tk.Canvas):
                     pgx = px + math.cos(pang) * pr
                     pgy = py + math.sin(pang) * pr
                     # Draw line from main to plus-one
-                    self.create_line(gx, gy, pgx, pgy, fill="#bbbbbb", width=1)
+                    self.create_line(
+                        gx, gy, pgx, pgy,
+                        fill="#bbbbbb",
+                        width=1,
+                        tags=(group_tag, f"attendee:{aid}")
+                    )
                     # Draw plus-one circle
                     oval_id_p = self.create_oval(
                         pgx - ATT_R_PX//2, pgy - ATT_R_PX//2, pgx + ATT_R_PX//2, pgy + ATT_R_PX//2,
