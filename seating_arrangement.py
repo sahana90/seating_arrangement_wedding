@@ -13,29 +13,31 @@ import logging
 # ======================================================
 
 class Config:
-    ROOM_L: float = 30.0
-    ROOM_H: float = 15.0
+    # [CHANGEME] Room dimensions in meters
+    ROOM_L: float = 30.0  # [CHANGEME] Room length in meters
+    ROOM_H: float = 15.0  # [CHANGEME] Room height in meters
     PIXELS_PER_METER: int = 60
-    VIEWPORT_W: int = 950
-    VIEWPORT_H: int = 600
-    SEATS_WARNING_LIMIT: int = 10
-    SEATS_PER_TABLE: int = 10
-    SPECIAL_TABLE: str = "Bride & Groom"
+    VIEWPORT_W: int = 1400  # Expanded for legend on right
+    VIEWPORT_H: int = 750   # Expanded for more display area
+    SEATS_WARNING_LIMIT: int = 11
+    SEATS_PER_TABLE: int = 11
+    SPECIAL_TABLE: str = "Noi"
     RELATIONSHIPS: list = [
         "Bride", "Groom", "Immediate Family", "Extended Family",
         "Childhood Friends", "UniversityFriends", "Colleagues"
     ]
-    TABLE_R_PX: int = 40
+    # [CHANGEME] Table dimensions
+    TABLE_R_PX: int = 45   # [CHANGEME] Attendee table radius in pixels (converts to ~0.75m at 60px/m)
     ATT_R_PX: int = 10
-    ORBIT_R_PX: int = 85
-    SPECIAL_W_PX: int = 220
-    SPECIAL_H_PX: int = 70
+    ORBIT_R_PX: int = 55
+    SPECIAL_W_PX: int = 90  # [CHANGEME] Special table width in pixels (converts to ~1.5m at 60px/m)
+    SPECIAL_H_PX: int = 54  # [CHANGEME] Special table height in pixels (converts to ~0.9m at 60px/m)
     CANVAS_BG: str = "#000000"
     CANVAS_BG_RGB: tuple = (0, 0, 0)
     MIN_ALPHA: float = 0.25
     MAX_ALPHA: float = 1.00
     DEFAULT_FOOD_ALLERGY: str = "none"
-    DEFAULT_PLUS_ONE_NAME: str = "AnyRandom"
+    DEFAULT_PLUS_ONE_NAME: str = "+1"
 
 ROOM_L = Config.ROOM_L
 ROOM_H = Config.ROOM_H
@@ -57,6 +59,7 @@ CANVAS_BG = Config.CANVAS_BG
 CANVAS_BG_RGB = Config.CANVAS_BG_RGB
 MIN_ALPHA = Config.MIN_ALPHA
 MAX_ALPHA = Config.MAX_ALPHA
+DIST_PLUS_ONE_PX = 20  # Distance offset for plus-one positioning in pixels
 
 
 def normalize_food_allergy_value(raw_value) -> str:
@@ -771,9 +774,10 @@ class PlannerCanvas(tk.Canvas):
                 )
                 label_color = "#ffffff"
             # --- WRAP TABLE LABEL TEXT ---
-            label_text = f"{table} ({len(guests)} guests/{self.model.table_headcount(guests)} heads)"
+            # label_text = f"{table} ({len(guests)} guests/{self.model.table_headcount(guests)} heads)"
+            label_text = f"{table} ({self.model.table_headcount(guests)})"
             # Split label_text into lines if too long
-            max_label_len = 22
+            max_label_len = 10
             label_lines = []
             while len(label_text) > max_label_len:
                 split_at = label_text.rfind(' ', 0, max_label_len)
@@ -784,7 +788,7 @@ class PlannerCanvas(tk.Canvas):
             label_lines.append(label_text)
             for idx, line in enumerate(label_lines):
                 self.create_text(
-                    px, py - 10 + idx*16,
+                    px, py - 0 + idx*20,
                     text=line,
                     fill=label_color,
                     font=("Arial", 11, "bold"),
@@ -820,8 +824,9 @@ class PlannerCanvas(tk.Canvas):
                     tags=(group_tag, f"attendee:{aid}", "attendee")
                 )
                 text_ids = self.draw_highlighted_text(
-                    gx, gy + 18,
-                    g.get("name", ""),
+                    gx-len(aid)/2, gy + 18,
+                    g.get("name", "").split(" ", 1)[0],
+                    #g.get("name", ""),
                     ("Arial", 8),
                     "#ffffff",
                     "#ffff00",
@@ -832,9 +837,42 @@ class PlannerCanvas(tk.Canvas):
                 plus_ones = g.get("plus_one", [])
                 n_plus = len(plus_ones)
                 for j, p in enumerate(plus_ones):
+                    # Draw plus-ones for this main invitee
                     pid = ensure_attendee_id(p)
+
+                    # Offset perpendicular to attendee orbit direction
+                    side_offset = (j - (n_plus - 1) / 2) * DIST_PLUS_ONE_PX
+
+                    # Perpendicular vector
+                    perp_x = -math.sin(ang)
+                    perp_y = math.cos(ang)
+
+                    # Position close to main attendee circle
+                    pgx = gx + perp_x * side_offset + math.cos(ang) * (ATT_R_PX * 0.9)
+                    pgy = gy + perp_y * side_offset + math.sin(ang) * (ATT_R_PX * 0.9)
+
+                    # Draw line from main to plus-one
+                    self.create_line(
+                        gx, gy, pgx, pgy,
+                        fill="#bbbbbb",
+                        width=1,
+                        tags=(group_tag, f"attendee:{aid}")
+                    )
+
+                    # Draw plus-one circle
+                    oval_id_p = self.create_oval(
+                        pgx - ATT_R_PX//2, pgy - ATT_R_PX//2,
+                        pgx + ATT_R_PX//2, pgy + ATT_R_PX//2,
+                        fill=self.attendee_color(p),
+                        outline="#ffffff",
+                        width=1,
+                        tags=(group_tag, f"attendee:{pid}", "attendee", "plusone")
+                    )
+                    
+                    
+                    """pid = ensure_attendee_id(p)
                     pang = ang + (j - (n_plus-1)/2) * (math.pi/8)
-                    pr = ORBIT_R_PX + 35
+                    pr = ORBIT_R_PX + DIST_PLUS_ONE_PX
                     pgx = px + math.cos(pang) * pr
                     pgy = py + math.sin(pang) * pr
                     # Draw line from main to plus-one
@@ -860,7 +898,7 @@ class PlannerCanvas(tk.Canvas):
                     )
                     self.attendee_items[pid] = (oval_id_p, text_ids_p)
                     # Bind right-click for editing
-                    self.tag_bind(f"attendee:{pid}", "<Button-3>", self.open_attendee_editor_from_event)
+                    self.tag_bind(f"attendee:{pid}", "<Button-3>", self.open_attendee_editor_from_event)"""
                 # Bindings for main invitee
                 self.tag_bind(f"attendee:{aid}", "<ButtonPress-1>",
                               lambda e, t=table, a=g, attendee_id=aid: self.start_attendee_drag(e, t, a, attendee_id))
