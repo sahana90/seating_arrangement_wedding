@@ -1,5 +1,6 @@
 import json
 import csv
+import io
 import math
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -405,14 +406,22 @@ class SeatingModel:
                 ])
         atomic_write_csv(path, rows)
 
-    def save_pdf(self, path="seating_arrangement.pdf"):
-        """Export invitees and their food requirements to a PDF report."""
+    def save_pdf(self, path="seating_arrangement.pdf", extra_images=None):
+        """Export invitees and their food requirements to a PDF report.
+
+        extra_images: optional list of (title, image_bytes) tuples. Each is
+        appended as its own page (title + the image scaled to fit) after the
+        main food-requirements table -- used for the "UI images" pages.
+        """
         try:
             from reportlab.lib import colors
             from reportlab.lib.pagesizes import landscape, A4
             from reportlab.lib.styles import getSampleStyleSheet
             from reportlab.lib.units import mm
-            from reportlab.platypus import SimpleDocTemplate, Spacer, Table, TableStyle, Paragraph
+            from reportlab.lib.utils import ImageReader
+            from reportlab.platypus import (
+                SimpleDocTemplate, Spacer, Table, TableStyle, Paragraph, PageBreak, Image,
+            )
         except ImportError as exc:
             raise RuntimeError("PDF export requires the reportlab package.") from exc
 
@@ -460,11 +469,34 @@ class SeatingModel:
             ("LEFTPADDING", (0, 0), (-1, -1), 4),
             ("RIGHTPADDING", (0, 0), (-1, -1), 4),
         ]))
-        pdf.build([
+        story = [
             Paragraph("Wedding Seating Food Requirements", styles["Title"]),
             Spacer(1, 6 * mm),
             table,
-        ])
+        ]
+
+        if extra_images:
+            page_w, page_h = landscape(A4)
+            avail_w = page_w - 24 * mm
+            avail_h = page_h - 30 * mm  # leave room for the page title
+            for title, image_bytes in extra_images:
+                if not image_bytes:
+                    continue
+                buf = io.BytesIO(image_bytes)
+                try:
+                    reader = ImageReader(buf)
+                    iw, ih = reader.getSize()
+                except Exception:
+                    continue
+                scale = min(avail_w / iw, avail_h / ih, 1.0)
+                draw_w, draw_h = iw * scale, ih * scale
+                buf.seek(0)
+                story.append(PageBreak())
+                story.append(Paragraph(str(title), styles["Title"]))
+                story.append(Spacer(1, 4 * mm))
+                story.append(Image(buf, width=draw_w, height=draw_h))
+
+        pdf.build(story)
 
     def _normalize_all_attendees(self):
         attendees = [a for guests in self.tables.values() for a in guests]
@@ -483,6 +515,26 @@ class SeatingModel:
             normalize_plus_one(a)
             normalize_food_allergy(a)
             normalize_food_preference(a)
+        # Guard against corrupted data where a plus-one (or main invitee)
+        # ended up with a duplicate _id -- e.g. from copy-pasting one
+        # attendee's JSON as a template for another and forgetting to
+        # change the id. A duplicate silently hides the affected guest
+        # from their table (the app mistakes them for a plus-one already
+        # accounted for) or misdirects drag/edit to the wrong person, so
+        # any collision found here is repaired with a fresh unique id.
+        seen_ids = set()
+        for a in attendees:
+            aid = a.get("_id")
+            if not aid or aid in seen_ids:
+                aid = uuid.uuid4().hex
+                a["_id"] = aid
+            seen_ids.add(aid)
+            for p in a.get("plus_one", []):
+                pid = p.get("_id")
+                if not pid or pid in seen_ids:
+                    pid = uuid.uuid4().hex
+                    p["_id"] = pid
+                seen_ids.add(pid)
         bride = next((a for a in attendees if a.get("relationship") == "Bride"), None)
         groom = next((a for a in attendees if a.get("relationship") == "Groom"), None)
         pool = [a for a in attendees if a not in (bride, groom)]
@@ -943,16 +995,26 @@ class PlannerCanvas(tk.Canvas):
             self.create_line(room_ox + 5, gpy, room_ox + CANVAS_W - 5, gpy, fill=grid_color,
                               dash=(2, 4), tags=("gridline",))
         legend_x, legend_y = self.model.legend_origin
-        legend_w = 460
+        legend_col_w = 230
+        legend_w = legend_col_w * 2
         line_h = 18
         legend_bg = "#111111"
         legend_border = "#333333"
-        total_lines = 1 + sum(1 + min(len(guests), 8) for guests in self.model.tables.values())
+
+        def table_line_count(table):
+            """Number of legend list rows this table needs: one per shown
+            main invitee (capped at 8, matching guests[:8] below) plus one
+            more for each of their plus-ones -- plus-ones are listed as
+            their own row, just like a main invitee."""
+            guests = self.model.tables.get(table, [])
+            return sum(1 + len(g.get("plus_one", [])) for g in guests[:8])
+
+        total_lines = 1 + sum(table_line_count(t) for t in self.model.tables.keys())
         legend_tables = list(self.model.tables.keys())
         legend_rows = []
         for row_index in range((len(legend_tables) + 1) // 2):
             row_tables = legend_tables[row_index * 2:row_index * 2 + 2]
-            row_lines = max(1 + min(len(self.model.tables[table]), 8) for table in row_tables)
+            row_lines = max(1 + table_line_count(table) for table in row_tables)
             legend_rows.append(row_lines)
         legend_height = legend_y - 16 + line_h + sum(row_lines * line_h + 6 for row_lines in legend_rows) + 6
         # Remember the panel's border so dragged legend entries can be
@@ -979,7 +1041,7 @@ class PlannerCanvas(tk.Canvas):
         for idx, table in enumerate(legend_tables):
             guests = self.model.tables.get(table, [])
             row_index, column_index = divmod(idx, 2)
-            default_x = legend_x + column_index * 230
+            default_x = legend_x + column_index * legend_col_w
             default_y = legend_y + line_h + sum(row_lines * line_h + 6 for row_lines in legend_rows[:row_index])
             is_default_pos = table not in self.legend_positions
             base_x, base_y = self.legend_positions.get(table, (default_x, default_y))
@@ -997,9 +1059,10 @@ class PlannerCanvas(tk.Canvas):
                 fill="#ffffff", font=("Arial", 9), anchor="w",
                 tags=(f"legend_group:{table}",) + panel_tags
             )
+            line_offset = 0
             for j, a in enumerate(guests[:8]):
                 c = self.attendee_color(a)
-                y = base_y + 16 + j * 14
+                y = base_y + 16 + line_offset * 14
                 oval_id = self.create_rectangle(
                     base_x + 22, y - 2,
                     base_x + 34, y + 10,
@@ -1017,6 +1080,26 @@ class PlannerCanvas(tk.Canvas):
                               lambda e, t=table, aid=ensure_attendee_id(a): self.start_legend_attendee_drag(e, t, aid))
                 self.tag_bind(f"legend_attendee:{table}:{ensure_attendee_id(a)}", "<B1-Motion>", self.drag_legend_attendee)
                 self.tag_bind(f"legend_attendee:{table}:{ensure_attendee_id(a)}", "<ButtonRelease-1>", self.end_legend_attendee_drag)
+                line_offset += 1
+                # List each plus-one as its own row, right below their main
+                # invitee, in the same style (color swatch + name) -- just
+                # display-only, no drag/reassign binding on these rows.
+                for p in a.get("plus_one", []):
+                    py_line = base_y + 16 + line_offset * 14
+                    pc = self.attendee_color(p)
+                    self.create_rectangle(
+                        base_x + 22, py_line - 2,
+                        base_x + 34, py_line + 10,
+                        fill=pc, outline="#ffffff", width=1,
+                        tags=(f"legend_group:{table}",) + panel_tags
+                    )
+                    self.create_text(
+                        base_x + 40, py_line + 4,
+                        text=p.get("name", ""),
+                        fill="#ffffff", font=("Arial", 7), anchor="w",
+                        tags=(f"legend_group:{table}",) + panel_tags
+                    )
+                    line_offset += 1
             # Bind drag for legend table
             self.tag_bind(f"legend_table:{table}", "<ButtonPress-1>",
                           lambda e, t=table: self.start_legend_table_drag(e, t))
@@ -1802,29 +1885,29 @@ class App(tk.Tk):
         self.search_var.trace("w", self.on_search_change)
         ttk.Button(top, text="Export PDF", command=self.export_pdf).pack(side="right", padx=8, pady=8)
         ttk.Button(top, text="Reset Layout", command=self.on_reset).pack(side="right", padx=8, pady=8)
-        tabs = ttk.Notebook(self)
-        tabs.pack(fill="both", expand=True)
-        planner_frame = ttk.Frame(tabs)
-        planner_frame.pack(fill="both", expand=True)
-        self.canvas = PlannerCanvas(planner_frame, self.model)
-        hbar = ttk.Scrollbar(planner_frame, orient="horizontal", command=self.canvas.xview)
-        vbar = ttk.Scrollbar(planner_frame, orient="vertical", command=self.canvas.yview)
+        self.tabs = ttk.Notebook(self)
+        self.tabs.pack(fill="both", expand=True)
+        self.planner_frame = ttk.Frame(self.tabs)
+        self.planner_frame.pack(fill="both", expand=True)
+        self.canvas = PlannerCanvas(self.planner_frame, self.model)
+        hbar = ttk.Scrollbar(self.planner_frame, orient="horizontal", command=self.canvas.xview)
+        vbar = ttk.Scrollbar(self.planner_frame, orient="vertical", command=self.canvas.yview)
         self.canvas.configure(xscrollcommand=hbar.set, yscrollcommand=vbar.set)
         self.canvas.grid(row=0, column=0, sticky="nsew")
         vbar.grid(row=0, column=1, sticky="ns")
         hbar.grid(row=1, column=0, sticky="ew")
-        planner_frame.rowconfigure(0, weight=1)
-        planner_frame.columnconfigure(0, weight=1)
-        viewer = ViewerTab(tabs)
-        self.technical_tab = TechnicalTab(tabs, self.model)
+        self.planner_frame.rowconfigure(0, weight=1)
+        self.planner_frame.columnconfigure(0, weight=1)
+        self.viewer = ViewerTab(self.tabs)
+        self.technical_tab = TechnicalTab(self.tabs, self.model)
         # Keep the read-only Technical Layout tab in sync with the Planner:
         # it redraws every time the Planner canvas redraws (search, reset,
         # editor save) and, importantly, right after a table is dragged.
         self.canvas.on_change_callbacks.append(self.technical_tab.refresh)
-        tabs.add(planner_frame, text="Planner")
-        tabs.add(viewer, text="Viewer")
-        tabs.add(self.technical_tab, text="Technical Layout")
-        tabs.bind("<<NotebookTabChanged>>", lambda e: self.technical_tab.refresh())
+        self.tabs.add(self.planner_frame, text="Planner")
+        self.tabs.add(self.viewer, text="Viewer")
+        self.tabs.add(self.technical_tab, text="Technical Layout")
+        self.tabs.bind("<<NotebookTabChanged>>", lambda e: self.technical_tab.refresh())
 
     def on_search_change(self, *args):
         self.canvas.search_string = self.search_var.get().strip()
@@ -1835,6 +1918,59 @@ class App(tk.Tk):
         self.model.enforce_table_capacity()
         self.canvas.draw()
 
+    def _capture_widget_image(self, widget):
+        """Capture the given widget's contents as PNG bytes.
+
+        Two strategies are tried, in order:
+          1. An OS-level screen grab (PIL.ImageGrab) -- best fidelity, but
+             needs a real, directly-accessible display and can fail under
+             some X11/WSL setups (e.g. remote/forwarded displays that
+             refuse the low-level XGetImage screen-capture call).
+          2. For a Canvas widget, Tk's own PostScript export -- rendered
+             from the canvas's draw list rather than the screen, so it
+             works regardless of the display setup, at the cost of needing
+             Ghostscript installed to rasterize the PostScript to PNG.
+        Returns None (never raises) if neither works, so PDF export still
+        succeeds -- just without that particular UI-image page.
+        """
+        self.update_idletasks()
+        self.update()
+
+        try:
+            from PIL import ImageGrab
+            x = widget.winfo_rootx()
+            y = widget.winfo_rooty()
+            w = widget.winfo_width()
+            h = widget.winfo_height()
+            if w > 0 and h > 0:
+                img = ImageGrab.grab(bbox=(x, y, x + w, y + h))
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                return buf.getvalue()
+        except Exception:
+            logging.info(
+                "Screen grab unavailable for PDF export screenshot; "
+                "trying the canvas's own PostScript export instead.",
+                exc_info=True,
+            )
+
+        if isinstance(widget, tk.Canvas):
+            try:
+                from PIL import Image
+                ps = widget.postscript(colormode="color")
+                img = Image.open(io.BytesIO(ps.encode("utf-8")))
+                img.load()
+                buf = io.BytesIO()
+                img.convert("RGB").save(buf, format="PNG")
+                return buf.getvalue()
+            except Exception:
+                logging.exception(
+                    "Canvas PostScript export also failed for PDF export screenshot "
+                    "(this fallback needs Ghostscript installed on PATH)."
+                )
+
+        return None
+
     def export_pdf(self):
         path = filedialog.asksaveasfilename(
             defaultextension=".pdf",
@@ -1843,12 +1979,48 @@ class App(tk.Tk):
         )
         if not path:
             return
+
+        # Best-effort: capture a screenshot of the Planner and Technical
+        # Layout tabs to embed as extra pages after the food-requirements
+        # table. Switching tabs briefly changes what's on screen, then the
+        # originally-selected tab is restored. If screenshots can't be taken
+        # (e.g. ImageGrab unavailable), export still proceeds without them.
+        extra_images = []
+        previously_selected = None
         try:
-            self.model.save_pdf(path)
+            previously_selected = self.tabs.select()
+            self.tabs.select(self.planner_frame)
+            self.lift()
+            planner_shot = self._capture_widget_image(self.canvas)
+            if planner_shot:
+                extra_images.append(("Planner Layout", planner_shot))
+
+            self.tabs.select(self.technical_tab)
+            self.lift()
+            technical_shot = self._capture_widget_image(self.technical_tab.canvas)
+            if technical_shot:
+                extra_images.append(("Technical Layout", technical_shot))
+        except Exception:
+            logging.exception("Failed while capturing UI screenshots for PDF export")
+        finally:
+            if previously_selected:
+                try:
+                    self.tabs.select(previously_selected)
+                except Exception:
+                    pass
+
+        try:
+            self.model.save_pdf(path, extra_images=extra_images)
         except Exception as exc:
             messagebox.showerror("PDF export error", f"Failed to export PDF:\n{exc}")
             return
-        messagebox.showinfo("PDF exported", f"PDF saved to:\n{path}")
+        if extra_images:
+            messagebox.showinfo(
+                "PDF exported",
+                f"PDF saved to:\n{path}\n\n(Includes {len(extra_images)} UI image page(s).)",
+            )
+        else:
+            messagebox.showinfo("PDF exported", f"PDF saved to:\n{path}")
 
     def on_close(self):
         self.model.save_json("seating_arrangement.json")
