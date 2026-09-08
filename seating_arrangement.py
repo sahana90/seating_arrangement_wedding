@@ -13,9 +13,12 @@ import logging
 # ======================================================
 
 class Config:
-    # [CHANGEME] Room dimensions in meters
-    ROOM_L: float = 30.0  # [CHANGEME] Room length in meters
-    ROOM_H: float = 15.0  # [CHANGEME] Room height in meters
+    # [CHANGEME] Room dimensions in meters -- matched to the venue floor plan
+    # (Sala Ricevimenti photo: overall room dimension "13000" mm on the
+    # dimensioned edge; room length is not fully dimensioned on the plan, so
+    # ROOM_L leaves margin beyond the furnished area shown there).
+    ROOM_L: float = 17.0  # [CHANGEME] Room length in meters
+    ROOM_H: float = 13.0  # [CHANGEME] Room height in meters (floor plan: 13000 mm)
     PIXELS_PER_METER: int = 60
     VIEWPORT_W: int = 1400  # Expanded for legend on right
     VIEWPORT_H: int = 750   # Expanded for more display area
@@ -39,6 +42,32 @@ class Config:
     DEFAULT_FOOD_ALLERGY: str = "none"
     DEFAULT_FOOD_PREFERENCE: str = "none"
     DEFAULT_PLUS_ONE_NAME: str = "+1"
+
+    # ------------------------------------------------------------------
+    # [CHANGEME] Real-world floor-plan dimensions (millimeters), read off
+    # the venue's CAD drawing. These drive both the default table layout
+    # and the mechanical-labelling dimensions shown on the Technical
+    # Layout tab. Adjust these to match the exact venue drawing if any
+    # value looks off -- they were transcribed from a photo of the plan.
+    # ------------------------------------------------------------------
+    TABLE_TOP_DIAMETER_MM: int = 1200        # [CHANGEME] round table diameter (inner solid circle on the plan)
+    TABLE_CLEARANCE_DIAMETER_MM: int = 2000  # [CHANGEME] table + chairs clearance zone (dashed outer circle on the plan)
+    TABLE_COL_SPACING_MM: int = 4200         # [CHANGEME] center-to-center spacing between the two table columns (plan shows 4200/4900)
+    TABLE_ROW_SPACING_MM: int = 2000         # [CHANGEME] center-to-center vertical spacing between tables in the same column
+    TABLE_ROW_STAGGER_MM: int = 1000         # [CHANGEME] vertical offset of the second column relative to the first (staggered/brick layout on the plan)
+    TABLE_FIRST_COL_OFFSET_MM: int = 2800    # [CHANGEME] distance from the left wall to the first table column's center
+    SPECIAL_TABLE_WALL_OFFSET_MM: int = 1200  # [CHANGEME] distance of the "Sposi" (bride & groom) table from the left wall
+    # Fixed service fixtures along the right wall, top to bottom, as shown
+    # on the plan. Their footprints aren't dimensioned there, so the
+    # width/height values below are reasonable placeholders -- [CHANGEME]
+    # to match your actual equipment.
+    FIXTURES: list = [
+        {"name": "Tableau", "w_mm": 700, "h_mm": 1300},
+        {"name": "Bomboniere", "w_mm": 900, "h_mm": 1700},
+        {"name": "DJ", "w_mm": 1200, "h_mm": 1700},
+        {"name": "PHOTOBOOT", "w_mm": 1200, "h_mm": 2100},
+    ]
+    FIXTURE_WALL_MARGIN_MM: int = 500  # [CHANGEME] gap between fixtures and the right wall
 
 ROOM_L = Config.ROOM_L
 ROOM_H = Config.ROOM_H
@@ -203,6 +232,8 @@ class SeatingModel:
         self.tables = {}
         self.table_positions = {}
         self.legend_positions = {}
+        self.legend_origin = (12, 12)  # top-left corner of the movable legend panel
+        self.last_moved_table = None   # name of the table last dragged on the Planner tab
 
     def table_headcount(self, guests: list) -> int:
         """Return total seats consumed at a table including +1 seats."""
@@ -236,23 +267,61 @@ class SeatingModel:
             chunks.append(current)
         return chunks
 
+    def _table_grid_position(self, index: int):
+        """Return (x_m, y_m) for the table at `index` (0-based) in the
+        staggered 2-column layout read off the venue floor plan: two
+        columns TABLE_COL_SPACING_MM apart, tables TABLE_ROW_SPACING_MM
+        apart within a column, and the second column offset vertically by
+        TABLE_ROW_STAGGER_MM to create the brick/staggered pattern shown
+        on the plan."""
+        x0_m = Config.TABLE_FIRST_COL_OFFSET_MM / 1000.0
+        col_spacing_m = Config.TABLE_COL_SPACING_MM / 1000.0
+        row_spacing_m = Config.TABLE_ROW_SPACING_MM / 1000.0
+        stagger_m = Config.TABLE_ROW_STAGGER_MM / 1000.0
+        top_margin_m = 1.5
+        col = index % 2
+        row = index // 2
+        x = x0_m + col * col_spacing_m
+        y = top_margin_m + row * row_spacing_m + (stagger_m if col == 1 else 0.0)
+        return x, y
+
+    def fixture_rects(self):
+        """Return the fixed room fixtures (Tableau, Bomboniere, DJ,
+        Photobooth) as (name, x_m, y_m, w_m, h_m) center-based rectangles
+        stacked along the right wall, per the venue floor plan. These are
+        fixed room features, not draggable tables."""
+        margin_m = Config.FIXTURE_WALL_MARGIN_MM / 1000.0
+        n = len(Config.FIXTURES)
+        slot_h = ROOM_H / n
+        rects = []
+        for i, fx in enumerate(Config.FIXTURES):
+            w_m = fx["w_mm"] / 1000.0
+            h_m = fx["h_mm"] / 1000.0
+            x = ROOM_L - margin_m - w_m / 2.0
+            y = slot_h * i + slot_h / 2.0
+            rects.append((fx["name"], x, y, w_m, h_m))
+        return rects
+
+    def _clamp_all_positions(self):
+        """Clamp every non-special table position within the current room
+        bounds (used after loading a saved layout, in case the room size
+        changed since it was saved)."""
+        for t, (x, y) in list(self.table_positions.items()):
+            if t == SPECIAL_TABLE:
+                continue
+            x = clamp(x, 2.0, ROOM_L - 2.0)
+            y = clamp(y, 2.0, ROOM_H - 2.0)
+            self.table_positions[t] = (x, y)
+
     def _assign_positions_to_missing_tables(self):
-        min_y = self._special_bottom_y_m()
         others = [t for t in self.tables.keys() if t != SPECIAL_TABLE and t not in self.table_positions]
         if not others:
             return
-        cols = 4
-        x_spacing_m = 4.2
-        y_spacing_m = 2.6
-        cx = ROOM_L / 2.0
         start_index = len([t for t in self.tables.keys() if t != SPECIAL_TABLE and t in self.table_positions])
-        for idx, t in enumerate(others, start=start_index):
-            row = idx // cols
-            col = idx % cols
-            x = cx + (col - (cols - 1) / 2) * x_spacing_m
-            y = min_y + row * y_spacing_m
+        for offset, t in enumerate(others):
+            x, y = self._table_grid_position(start_index + offset)
             x = clamp(x, 2.0, ROOM_L - 2.0)
-            y = clamp(y, min_y, ROOM_H - 2.0)
+            y = clamp(y, 2.0, ROOM_H - 2.0)
             self.table_positions[t] = (x, y)
 
     def _rebalance_overflow_tables(self) -> bool:
@@ -286,6 +355,7 @@ class SeatingModel:
                 raw = json.load(f)
             self.table_positions = raw.pop("_table_positions", {})
             self.legend_positions = raw.pop("_legend_positions", {})
+            legend_origin_raw = raw.pop("_legend_origin", [12, 12])
             self.tables = raw
             for k, v in list(self.table_positions.items()):
                 if isinstance(v, list) and len(v) == 2:
@@ -293,9 +363,11 @@ class SeatingModel:
             for k, v in list(self.legend_positions.items()):
                 if isinstance(v, list) and len(v) == 2:
                     self.legend_positions[k] = (float(v[0]), float(v[1]))
+            if isinstance(legend_origin_raw, list) and len(legend_origin_raw) == 2:
+                self.legend_origin = (float(legend_origin_raw[0]), float(legend_origin_raw[1]))
             self._normalize_all_attendees()
             self._ensure_special_table_position()
-            self._ensure_non_special_tables_below_special()
+            self._clamp_all_positions()
             missing = [t for t in self.tables.keys() if t not in self.table_positions]
             if missing:
                 self.reset_layout()
@@ -313,6 +385,7 @@ class SeatingModel:
         data = dict(self.tables)
         data["_table_positions"] = {k: [float(x), float(y)] for k, (x, y) in self.table_positions.items()}
         data["_legend_positions"] = {k: [float(x), float(y)] for k, (x, y) in self.legend_positions.items()}
+        data["_legend_origin"] = [float(self.legend_origin[0]), float(self.legend_origin[1])]
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
 
@@ -447,24 +520,11 @@ class SeatingModel:
             self.tables[SPECIAL_TABLE].append(groom)
 
     def _ensure_special_table_position(self):
-        cx = ROOM_L / 2.0
-        cy = 1.5
+        # Placed on the left wall at the room's vertical center, matching
+        # the "Sposi" (bride & groom) table position on the venue floor plan.
+        cx = Config.SPECIAL_TABLE_WALL_OFFSET_MM / 1000.0
+        cy = ROOM_H / 2.0
         self.table_positions[SPECIAL_TABLE] = (cx, cy)
-
-    def _special_bottom_y_m(self):
-        half_h_m = (SPECIAL_H_PX / PIXELS_PER_METER) / 2.0
-        margin_m = 0.6
-        return self.table_positions[SPECIAL_TABLE][1] + half_h_m + margin_m
-
-    def _ensure_non_special_tables_below_special(self):
-        min_y = self._special_bottom_y_m()
-        for t in self.tables.keys():
-            if t == SPECIAL_TABLE:
-                continue
-            x, y = self.table_positions.get(t, (ROOM_L/2, min_y + 1.0))
-            if y < min_y:
-                y = min_y
-            self.table_positions[t] = (x, y)
 
     def generate_from_attendees(self, path="attendees.json"):
         if not os.path.exists(path):
@@ -518,7 +578,6 @@ class SeatingModel:
     def reset_layout(self):
         self._normalize_all_attendees()
         self._ensure_special_table_position()
-        min_y = self._special_bottom_y_m()
         others = [t for t in self.tables.keys() if t != SPECIAL_TABLE]
         def table_priority(t):
             guests = self.tables[t]
@@ -526,19 +585,11 @@ class SeatingModel:
                 return 999
             return min(g.get("category", 999) for g in guests)
         others.sort(key=table_priority)
-        cx = ROOM_L / 2.0
-        cols = 4
-        x_spacing_m = 4.2
-        y_spacing_m = 2.6
         for i, t in enumerate(others):
-            row = i // cols
-            col = i % cols
-            x = cx + (col - (cols - 1) / 2) * x_spacing_m
-            y = min_y + row * y_spacing_m
+            x, y = self._table_grid_position(i)
             x = clamp(x, 2.0, ROOM_L - 2.0)
-            y = clamp(y, min_y, ROOM_H - 2.0)
+            y = clamp(y, 2.0, ROOM_H - 2.0)
             self.table_positions[t] = (x, y)
-        self._ensure_non_special_tables_below_special()
 
     def enforce_table_capacity(self, show_dialog=True):
         for t, guests in self.tables.items():
@@ -573,10 +624,52 @@ class PlannerCanvas(tk.Canvas):
         self.attendee_items = {}
         self.search_string = ""
         self.legend_positions = model.legend_positions
+        # Callbacks invoked whenever table positions may have changed, so
+        # other views (e.g. the read-only Technical Layout tab) can refresh
+        # to reflect the tables' latest positions.
+        self.on_change_callbacks = []
+        # Bounding box of the movable legend panel (background box), set on
+        # every draw() -- used to keep dragged legend entries inside it.
+        self.legend_panel_bounds = (0, 0, 0, 0)
+        # Keep the room centered in the visible viewport: whenever this
+        # widget is resized, recompute the centering offset and redraw. The
+        # room, tables, fixtures and grid lines all share this one offset,
+        # so they always move together as a single rigid scene.
+        self.bind("<Configure>", self._on_resize)
         self.draw()
 
     def m2px(self, v):
+        """Convert a real-world length (radius, width, ...) to pixels -- no
+        centering offset, since a length isn't tied to a screen position."""
         return v * PIXELS_PER_METER
+
+    def room_offset(self):
+        """Pixel offset that centers the room (and everything anchored to
+        it: tables, fixtures, grid lines) within the widget's current
+        visible size. The legend is intentionally NOT affected -- it has
+        its own independent, user-movable position."""
+        vw = self.winfo_width() or VIEWPORT_W
+        vh = self.winfo_height() or VIEWPORT_H
+        ox = max(0, (vw - CANVAS_W) / 2)
+        oy = max(0, (vh - CANVAS_H) / 2)
+        return ox, oy
+
+    def m2px_pos(self, x_m, y_m):
+        """Convert a real-world (x, y) position in meters to a centered
+        canvas pixel position."""
+        ox, oy = self.room_offset()
+        return x_m * PIXELS_PER_METER + ox, y_m * PIXELS_PER_METER + oy
+
+    def _on_resize(self, event):
+        # Only react to actual size changes of this widget (not every
+        # Configure event, e.g. ones bubbling from child items).
+        if event.width != getattr(self, "_last_width", None) or event.height != getattr(self, "_last_height", None):
+            self._last_width, self._last_height = event.width, event.height
+            self.draw()
+
+    def _notify_change(self):
+        for cb in self.on_change_callbacks:
+            cb()
 
     def _find_attendee(self, attendee_id: str):
         """Locate attendee and its table using attendee id."""
@@ -815,12 +908,41 @@ class PlannerCanvas(tk.Canvas):
             f"Wedding Seating Planner - Invitees: {self.model.total_invitees()} "
             f"(including +1s: {self.model.total_headcount()})"
         )
+        # The room outline, fixtures, grid lines and tables are all placed
+        # using this one offset, so the room is centered in the visible
+        # viewport and everything anchored to it moves together as a single
+        # rigid scene if the viewport is resized. The legend is deliberately
+        # excluded -- it has its own independent, user-movable position.
+        room_ox, room_oy = self.room_offset()
         self.create_rectangle(
-            5, 5, CANVAS_W - 5, CANVAS_H - 5,
+            room_ox + 5, room_oy + 5, room_ox + CANVAS_W - 5, room_oy + CANVAS_H - 5,
             outline="#333333", width=2
         )
-        legend_x = 12
-        legend_y = 12
+        # Fixed room fixtures (Tableau, Bomboniere, DJ, Photobooth) along the
+        # right wall, per the venue floor plan. These are reference-only:
+        # no tag_bind is attached, so they cannot be dragged.
+        for name, x_m, y_m, w_m, h_m in self.model.fixture_rects():
+            fpx, fpy = self.m2px_pos(x_m, y_m)
+            fw, fh = self.m2px(w_m), self.m2px(h_m)
+            self.create_rectangle(
+                fpx - fw / 2, fpy - fh / 2, fpx + fw / 2, fpy + fh / 2,
+                outline="#f5d76e", width=2, tags=("fixture",)
+            )
+            self.create_text(
+                fpx, fpy, text=name, fill="#f5d76e",
+                font=("Arial", 9, "bold"), tags=("fixture",)
+            )
+        # Alignment grid: a full-width/height guide line through the center
+        # of every table (including "Sposi"), so rows and columns are easy
+        # to eyeball while dragging tables around.
+        grid_color = "#262626"
+        for _table, (gx_m, gy_m) in self.model.table_positions.items():
+            gpx, gpy = self.m2px_pos(gx_m, gy_m)
+            self.create_line(gpx, room_oy + 5, gpx, room_oy + CANVAS_H - 5, fill=grid_color,
+                              dash=(2, 4), tags=("gridline",))
+            self.create_line(room_ox + 5, gpy, room_ox + CANVAS_W - 5, gpy, fill=grid_color,
+                              dash=(2, 4), tags=("gridline",))
+        legend_x, legend_y = self.model.legend_origin
         legend_w = 460
         line_h = 18
         legend_bg = "#111111"
@@ -833,31 +955,47 @@ class PlannerCanvas(tk.Canvas):
             row_lines = max(1 + min(len(self.model.tables[table]), 8) for table in row_tables)
             legend_rows.append(row_lines)
         legend_height = legend_y - 16 + line_h + sum(row_lines * line_h + 6 for row_lines in legend_rows) + 6
+        # Remember the panel's border so dragged legend entries can be
+        # clamped to stay inside it (see drag_legend_table).
+        self.legend_panel_bounds = (legend_x - 16, legend_y - 16, legend_x + legend_w, legend_height)
+        # The background box and title are the drag handle for the whole
+        # legend panel (tag "legend_panel"); every item tagged
+        # "legend_panel_group" moves together with them. Per-table entries
+        # the user has individually dragged elsewhere (present in
+        # self.legend_positions) are left out of that group so they stay
+        # exactly where the user put them.
         self.create_rectangle(
             legend_x - 16, legend_y - 16,
             legend_x + legend_w, legend_height,
-            fill=legend_bg, outline=legend_border, width=1
+            fill=legend_bg, outline=legend_border, width=1,
+            tags=("legend_panel", "legend_panel_group")
         )
-        self.create_text(legend_x, legend_y - 2, text="Legend (by table colors)",
-                          fill="#ffffff", font=("Arial", 10, "bold"), anchor="nw")
+        self.create_text(legend_x, legend_y - 2, text="Legend (by table colors) - drag to move",
+                          fill="#ffffff", font=("Arial", 10, "bold"), anchor="nw",
+                          tags=("legend_panel", "legend_panel_group"))
+        self.tag_bind("legend_panel", "<ButtonPress-1>", self.start_legend_panel_drag)
+        self.tag_bind("legend_panel", "<B1-Motion>", self.drag_legend_panel)
+        self.tag_bind("legend_panel", "<ButtonRelease-1>", self.end_legend_panel_drag)
         for idx, table in enumerate(legend_tables):
             guests = self.model.tables.get(table, [])
             row_index, column_index = divmod(idx, 2)
             default_x = legend_x + column_index * 230
             default_y = legend_y + line_h + sum(row_lines * line_h + 6 for row_lines in legend_rows[:row_index])
+            is_default_pos = table not in self.legend_positions
             base_x, base_y = self.legend_positions.get(table, (default_x, default_y))
+            panel_tags = ("legend_panel_group",) if is_default_pos else ()
             rep = guests[0] if guests else None
             header_color = self.attendee_color(rep) if rep else "#666666"
             rect_id = self.create_rectangle(
                 base_x, base_y, base_x + 14, base_y + 14,
                 fill=header_color, outline="#ffffff", width=1,
-                tags=(f"legend_group:{table}", f"legend_table:{table}")
+                tags=(f"legend_group:{table}", f"legend_table:{table}") + panel_tags
             )
             self.create_text(
                 base_x + 22, base_y + 7,
                 text=f"{table}",
                 fill="#ffffff", font=("Arial", 9), anchor="w",
-                tags=(f"legend_group:{table}",)
+                tags=(f"legend_group:{table}",) + panel_tags
             )
             for j, a in enumerate(guests[:8]):
                 c = self.attendee_color(a)
@@ -866,13 +1004,13 @@ class PlannerCanvas(tk.Canvas):
                     base_x + 22, y - 2,
                     base_x + 34, y + 10,
                     fill=c, outline="#ffffff", width=1,
-                    tags=(f"legend_group:{table}", f"legend_attendee:{table}:{ensure_attendee_id(a)}")
+                    tags=(f"legend_group:{table}", f"legend_attendee:{table}:{ensure_attendee_id(a)}") + panel_tags
                 )
                 self.create_text(
                     base_x + 40, y + 4,
                     text=a.get("name", ""),
                     fill="#ffffff", font=("Arial", 7), anchor="w",
-                    tags=(f"legend_group:{table}",)
+                    tags=(f"legend_group:{table}",) + panel_tags
                 )
                 # Bind drag for legend attendee
                 self.tag_bind(f"legend_attendee:{table}:{ensure_attendee_id(a)}", "<ButtonPress-1>",
@@ -886,11 +1024,11 @@ class PlannerCanvas(tk.Canvas):
             self.tag_bind(f"legend_table:{table}", "<ButtonRelease-1>", self.end_legend_table_drag)
         for table, guests in self.model.tables.items():
             tx, ty = self.model.table_positions.get(table, (ROOM_L / 2, ROOM_H / 2))
-            px, py = self.m2px(tx), self.m2px(ty)
+            px, py = self.m2px_pos(tx, ty)
             group_tag = f"group:{table}"
             handle_tag = f"handle:{table}"
             if table == SPECIAL_TABLE:
-                w, h = SPECIAL_W_PX, SPECIAL_H_PX
+                h, w = SPECIAL_W_PX, SPECIAL_H_PX
                 self.create_rectangle(
                     px - w / 2, py - h / 2, px + w / 2, py + h / 2,
                     fill="#222222", outline="#f5d76e", width=2,
@@ -943,12 +1081,42 @@ class PlannerCanvas(tk.Canvas):
             # Filter guests_sorted to only main invitees
             guests_sorted = [g for g in sorted(guests, key=lambda g: (int(g.get("category", 99)), g.get("name", ""))) if g.get("_id") not in plusone_ids]
             n = len(guests_sorted)
+            # For the Sposi (bride & groom) table: seat both of them
+            # together on the side of their table that faces AWAY from the
+            # other guest tables, instead of the generic all-round orbit
+            # used for regular tables.
+            seat_positions = None
+            special_ang = None
+            if table == SPECIAL_TABLE:
+                other_positions = [p for t2, p in self.model.table_positions.items() if t2 != SPECIAL_TABLE]
+                if other_positions:
+                    cx_other = sum(p[0] for p in other_positions) / len(other_positions)
+                    cy_other = sum(p[1] for p in other_positions) / len(other_positions)
+                    dvx, dvy = cx_other - tx, cy_other - ty
+                else:
+                    dvx, dvy = 1.0, 0.0
+                mag = math.hypot(dvx, dvy) or 1.0
+                away_x, away_y = -dvx / mag, -dvy / mag  # points away from the other tables
+                perp_x, perp_y = -away_y, away_x
+                special_ang = math.atan2(away_y, away_x)
+                spacing_px = ATT_R_PX * 2 + 6
+                seat_positions = []
+                for i2 in range(n):
+                    side_offset = (i2 - (n - 1) / 2) * spacing_px
+                    seat_positions.append((
+                        px + away_x * ORBIT_R_PX + perp_x * side_offset,
+                        py + away_y * ORBIT_R_PX + perp_y * side_offset,
+                    ))
             # --- Render main invitees and plus-ones visually ---
             for i, g in enumerate(guests_sorted):
                 aid = ensure_attendee_id(g)
-                ang = 2 * math.pi * i / max(1, n)
-                gx = px + math.cos(ang) * ORBIT_R_PX
-                gy = py + math.sin(ang) * ORBIT_R_PX
+                if seat_positions is not None:
+                    gx, gy = seat_positions[i]
+                    ang = special_ang
+                else:
+                    ang = 2 * math.pi * i / max(1, n)
+                    gx = px + math.cos(ang) * ORBIT_R_PX
+                    gy = py + math.sin(ang) * ORBIT_R_PX
                 color = self.attendee_color(g)
                 r = ATT_R_PX
                 oval_id = self.create_oval(
@@ -1041,6 +1209,7 @@ class PlannerCanvas(tk.Canvas):
                               lambda e, a=g, attendee_id=aid: self.end_attendee_drag(e, a, attendee_id))
                 self.tag_bind(f"attendee:{aid}", "<Double-Button-3>", self.open_attendee_editor_from_event)
         self.configure(scrollregion=self.bbox("all"))
+        self._notify_change()
 
     def start_table_drag(self, e, table):
         self.drag = {
@@ -1067,34 +1236,61 @@ class PlannerCanvas(tk.Canvas):
             self.drag = None
             return "break"
         table = self.drag["table"]
-        x = self.canvasx(e.x) / PIXELS_PER_METER
-        y = self.canvasy(e.y) / PIXELS_PER_METER
-        min_y = self.model._special_bottom_y_m()
-        y = max(y, min_y)
+        # Bug fix: table positions are stored in room-relative meters, but
+        # the room is drawn with a centering offset (room_offset). The
+        # drop point must have that same offset subtracted before
+        # converting to meters, or the table snaps away from where it was
+        # actually dropped as soon as draw() re-renders it.
+        ox, oy = self.room_offset()
+        x = (self.canvasx(e.x) - ox) / PIXELS_PER_METER
+        y = (self.canvasy(e.y) - oy) / PIXELS_PER_METER
         x = clamp(x, 2.0, ROOM_L - 2.0)
-        y = clamp(y, min_y, ROOM_H - 2.0)
+        y = clamp(y, 2.0, ROOM_H - 2.0)
         self.model.table_positions[table] = (x, y)
+        self.model.last_moved_table = table
         self.drag = None
+        # Full redraw so the grid lines (which pass through each table's
+        # center) and the Technical Layout tab's distances line up exactly
+        # with the clamped drop position, not the raw mouse position.
+        self.draw()
         return "break"
 
-    def start_legend_table_drag(self, e, table):
+    def start_legend_panel_drag(self, e):
+        """Grab the legend panel (its background box or title) to move the
+        whole panel -- and every entry still at its default position -- as
+        one unit."""
         self.drag = {
-            "type": "legend_table",
-            "table": table,
+            "type": "legend_panel",
             "x": self.canvasx(e.x),
-            "y": self.canvasy(e.y)
+            "y": self.canvasy(e.y),
+            "start_x": self.canvasx(e.x),
+            "start_y": self.canvasy(e.y),
         }
         return "break"
 
-    def drag_legend_table(self, e):
-        if not self.drag or self.drag.get("type") != "legend_table":
+    def drag_legend_panel(self, e):
+        if not self.drag or self.drag.get("type") != "legend_panel":
             return "break"
         x = self.canvasx(e.x)
         y = self.canvasy(e.y)
         dx = x - self.drag["x"]
         dy = y - self.drag["y"]
-        # Removed: self.move(f"group:{self.drag['table']}", dx, dy)
+        self.move("legend_panel_group", dx, dy)
         self.drag["x"], self.drag["y"] = x, y
+        return "break"
+
+    def end_legend_panel_drag(self, e):
+        if not self.drag or self.drag.get("type") != "legend_panel":
+            self.drag = None
+            return "break"
+        x = self.canvasx(e.x)
+        y = self.canvasy(e.y)
+        dx = x - self.drag["start_x"]
+        dy = y - self.drag["start_y"]
+        ox, oy = self.model.legend_origin
+        self.model.legend_origin = (ox + dx, oy + dy)
+        self.drag = None
+        self.draw()
         return "break"
 
     def start_legend_attendee_drag(self, e, table, attendee_id):
@@ -1136,7 +1332,7 @@ class PlannerCanvas(tk.Canvas):
         for table, (tx, ty) in self.model.table_positions.items():
             if table == old_table:
                 continue
-            px, py = self.m2px(tx), self.m2px(ty)
+            px, py = self.m2px_pos(tx, ty)
             dist = math.hypot(x - px, y - py)
             if dist < (ATT_R_PX + TABLE_R_PX):
                 if best_dist is None or dist < best_dist:
@@ -1176,7 +1372,26 @@ class PlannerCanvas(tk.Canvas):
         y = self.canvasy(e.y)
         dx = x - self.drag["x"]
         dy = y - self.drag["y"]
-        self.move(f"legend_group:{self.drag['table']}", dx, dy)
+        table = self.drag["table"]
+        group_tag = f"legend_group:{table}"
+        # Keep the legend grouped: clamp the move so this table's entire
+        # entry (header + its attendee rows) never leaves the legend
+        # panel's border.
+        bbox = self.bbox(group_tag)
+        lx1, ly1, lx2, ly2 = self.legend_panel_bounds
+        if bbox:
+            bx1, by1, bx2, by2 = bbox
+            new_x1, new_x2 = bx1 + dx, bx2 + dx
+            new_y1, new_y2 = by1 + dy, by2 + dy
+            if new_x1 < lx1:
+                dx += (lx1 - new_x1)
+            elif new_x2 > lx2:
+                dx -= (new_x2 - lx2)
+            if new_y1 < ly1:
+                dy += (ly1 - new_y1)
+            elif new_y2 > ly2:
+                dy -= (new_y2 - ly2)
+        self.move(group_tag, dx, dy)
         self.drag["x"], self.drag["y"] = x, y
         return "break"
 
@@ -1185,10 +1400,13 @@ class PlannerCanvas(tk.Canvas):
             self.drag = None
             return "break"
         table = self.drag["table"]
-        x = self.canvasx(e.x)
-        y = self.canvasy(e.y)
-        # Update position
-        self.model.legend_positions[table] = (x - 7, y - 7)  # Adjust for the rect center
+        # Read back the entry's actual (possibly border-clamped) header
+        # position rather than the raw mouse position, so it's stored
+        # exactly where it visually ended up.
+        rect_bbox = self.bbox(f"legend_table:{table}")
+        if rect_bbox:
+            bx1, by1, _, _ = rect_bbox
+            self.model.legend_positions[table] = (bx1, by1)
         self.drag = None
         return "break"
 
@@ -1237,7 +1455,7 @@ class PlannerCanvas(tk.Canvas):
         for table, (tx, ty) in self.model.table_positions.items():
             if table in (SPECIAL_TABLE, old_table):
                 continue
-            px, py = self.m2px(tx), self.m2px(ty)
+            px, py = self.m2px_pos(tx, ty)
             dist = math.hypot(ax - px, ay - py)
             if dist < (ATT_R_PX + TABLE_R_PX):
                 if best_dist is None or dist < best_dist:
@@ -1329,6 +1547,233 @@ class ViewerTab(ttk.Frame):
             self.text.insert("1.0", f.read())
 
 # ======================================================
+# Technical Layout Tab (read-only mechanical labelling)
+# ======================================================
+
+class TechnicalTab(ttk.Frame):
+    """Read-only technical/mechanical floor-plan view.
+
+    Shows the room outline, the fixed fixtures (Tableau, Bomboniere, DJ,
+    Photobooth) and the round tables at their *current* positions, each
+    annotated with millimeter dimensions -- mirroring the style of the
+    venue's CAD floor plan. This tab has no drag/click bindings of any
+    kind: it is purely for reference and hand-off (e.g. to the venue or
+    installers), and it is refreshed automatically whenever a table is
+    moved on the Planner tab (see App.__init__ / PlannerCanvas.on_change_callbacks).
+
+    The "Show distance to closest table (all tables)" checkbox toggles
+    between a decluttered default (only the most recently moved table's
+    distance to its nearest neighbor) and showing every table's distance
+    to its own closest neighbor. Room, fixture and table size labels are
+    always shown either way.
+    """
+    def __init__(self, parent, model: SeatingModel):
+        super().__init__(parent)
+        self.model = model
+        self.show_all_var = tk.BooleanVar(value=False)
+        toolbar = ttk.Frame(self)
+        toolbar.grid(row=0, column=0, columnspan=2, sticky="ew")
+        ttk.Checkbutton(
+            toolbar, text="Show distance to closest table (all tables)",
+            variable=self.show_all_var, command=self.refresh
+        ).pack(side="left", padx=6, pady=4)
+        self.canvas = tk.Canvas(
+            self, width=VIEWPORT_W, height=VIEWPORT_H, bg=CANVAS_BG,
+            highlightthickness=0, scrollregion=(0, 0, CANVAS_W, CANVAS_H)
+        )
+        hbar = ttk.Scrollbar(self, orient="horizontal", command=self.canvas.xview)
+        vbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(xscrollcommand=hbar.set, yscrollcommand=vbar.set)
+        self.canvas.grid(row=1, column=0, sticky="nsew")
+        vbar.grid(row=1, column=1, sticky="ns")
+        hbar.grid(row=2, column=0, sticky="ew")
+        self.rowconfigure(1, weight=1)
+        self.columnconfigure(0, weight=1)
+        # Keep the room centered in this tab's viewport too, and redraw on
+        # resize -- see PlannerCanvas.room_offset for the rationale.
+        self.canvas.bind("<Configure>", self._on_resize)
+        # NOTE: intentionally no other tag_bind/bind calls anywhere in this
+        # class -- this view is display-only and never mutates the model.
+        self.refresh()
+
+    def _on_resize(self, event):
+        if event.width != getattr(self, "_last_width", None) or event.height != getattr(self, "_last_height", None):
+            self._last_width, self._last_height = event.width, event.height
+            self.refresh()
+
+    def m2px(self, v):
+        """Convert a real-world length (radius, width, ...) to pixels -- no
+        centering offset, since a length isn't tied to a screen position."""
+        return v * PIXELS_PER_METER
+
+    def room_offset(self):
+        """Pixel offset that centers the room within this tab's current
+        visible size (mirrors PlannerCanvas.room_offset)."""
+        vw = self.canvas.winfo_width() or VIEWPORT_W
+        vh = self.canvas.winfo_height() or VIEWPORT_H
+        ox = max(0, (vw - CANVAS_W) / 2)
+        oy = max(0, (vh - CANVAS_H) / 2)
+        return ox, oy
+
+    def m2px_pos(self, x_m, y_m):
+        ox, oy = self.room_offset()
+        return x_m * PIXELS_PER_METER + ox, y_m * PIXELS_PER_METER + oy
+
+    def _dim_line(self, x1, y1, x2, y2, text, offset=16, vertical=False):
+        """Draw a CAD-style dimension line with arrowheads and a millimeter label."""
+        c = self.canvas
+        c.create_line(x1, y1, x2, y2, fill="#66ccff", width=1,
+                       arrow=tk.BOTH, arrowshape=(8, 10, 3))
+        if vertical:
+            c.create_text(x1 + offset, (y1 + y2) / 2, text=text,
+                           fill="#66ccff", font=("Arial", 8), angle=90)
+        else:
+            c.create_text((x1 + x2) / 2, y1 - offset, text=text,
+                           fill="#66ccff", font=("Arial", 8))
+
+    def _draw_nearest_neighbor(self, table_items):
+        """Highlight the live distance from the table most recently
+        dragged on the Planner tab to whichever other table (including
+        "Sposi") is currently closest to it. Recomputed from the model's
+        live positions on every refresh, so it always reflects wherever
+        the table was just dropped."""
+        target = self.model.last_moved_table
+        if not target:
+            return
+        positions = dict(table_items)
+        if target not in positions:
+            return
+        candidates = dict(table_items)
+        if SPECIAL_TABLE in self.model.table_positions:
+            candidates[SPECIAL_TABLE] = self.model.table_positions[SPECIAL_TABLE]
+        x1, y1 = positions[target]
+        best = None
+        for t2, (x2, y2) in candidates.items():
+            if t2 == target:
+                continue
+            dist = math.hypot(x2 - x1, y2 - y1)
+            if best is None or dist < best[0]:
+                best = (dist, t2, x2, y2)
+        if not best:
+            return
+        dist, t2, x2, y2 = best
+        c = self.canvas
+        px1, py1 = self.m2px_pos(x1, y1)
+        px2, py2 = self.m2px_pos(x2, y2)
+        mm = round(dist * 1000)
+        c.create_line(px1, py1, px2, py2, fill="#ffcc00", width=2,
+                       arrow=tk.BOTH, arrowshape=(8, 10, 3))
+        c.create_text(
+            (px1 + px2) / 2, (py1 + py2) / 2 - 10,
+            text=f"{target} → {t2}: {mm} mm (nearest)",
+            fill="#ffcc00", font=("Arial", 8, "bold")
+        )
+
+    def _draw_all_measurements(self, table_items):
+        """'Show distance to closest table' mode: for EVERY table
+        (including "Sposi"), draw a line + mm label to whichever other
+        table is currently closest to it -- not a full pairwise mesh, just
+        each table's own nearest neighbor. Recomputed live from the
+        model's current positions. Room/fixture/table size labels are
+        drawn regardless of this toggle -- see refresh(). The most
+        recently moved table's line is additionally highlighted on top."""
+        c = self.canvas
+        all_items = list(table_items)
+        if SPECIAL_TABLE in self.model.table_positions:
+            all_items.append((SPECIAL_TABLE, self.model.table_positions[SPECIAL_TABLE]))
+        drawn_pairs = set()
+        for t1, (x1, y1) in all_items:
+            best = None
+            for t2, (x2, y2) in all_items:
+                if t2 == t1:
+                    continue
+                dist = math.hypot(x2 - x1, y2 - y1)
+                if best is None or dist < best[0]:
+                    best = (dist, t2, x2, y2)
+            if not best:
+                continue
+            dist, t2, x2, y2 = best
+            pair = tuple(sorted((t1, t2)))
+            if pair in drawn_pairs:
+                continue
+            drawn_pairs.add(pair)
+            mm = round(dist * 1000)
+            px1, py1 = self.m2px_pos(x1, y1)
+            px2, py2 = self.m2px_pos(x2, y2)
+            c.create_line(px1, py1, px2, py2, fill="#3a5a75", width=1, dash=(2, 3))
+            c.create_text((px1 + px2) / 2, (py1 + py2) / 2, text=f"{mm} mm",
+                           fill="#7fb2d9", font=("Arial", 6))
+        # Still highlight the most recently moved table's nearest neighbor
+        # on top, in a brighter color, so it's easy to spot among the rest.
+        self._draw_nearest_neighbor(table_items)
+
+    def refresh(self):
+        """Redraw this tab from the model's current state. Safe to call at
+        any time -- e.g. after a table is dragged on the Planner tab."""
+        c = self.canvas
+        c.delete("all")
+        room_ox, room_oy = self.room_offset()
+        c.create_rectangle(room_ox + 5, room_oy + 5, room_ox + CANVAS_W - 5, room_oy + CANVAS_H - 5,
+                            outline="#333333", width=2)
+        c.create_text(
+            room_ox + 12, room_oy + 12, text=f"Room: {ROOM_L * 1000:.0f} x {ROOM_H * 1000:.0f} mm (read-only)",
+            fill="#ffffff", font=("Arial", 10, "bold"), anchor="nw"
+        )
+        self._dim_line(room_ox + 5, room_oy + CANVAS_H - 5, room_ox + CANVAS_W - 5, room_oy + CANVAS_H - 5,
+                        f"{ROOM_L * 1000:.0f} mm", offset=18)
+        self._dim_line(room_ox + CANVAS_W - 5, room_oy + 5, room_ox + CANVAS_W - 5, room_oy + CANVAS_H - 5,
+                        f"{ROOM_H * 1000:.0f} mm", offset=18, vertical=True)
+
+        # Fixed fixtures
+        for name, x_m, y_m, w_m, h_m in self.model.fixture_rects():
+            px, py = self.m2px_pos(x_m, y_m)
+            w, h = self.m2px(w_m), self.m2px(h_m)
+            c.create_rectangle(px - w / 2, py - h / 2, px + w / 2, py + h / 2,
+                                outline="#f5d76e", width=2)
+            c.create_text(px, py, text=name, fill="#ffffff", font=("Arial", 9, "bold"))
+            c.create_text(px, py + h / 2 + 10, text=f"{w_m * 1000:.0f} x {h_m * 1000:.0f} mm",
+                          fill="#66ccff", font=("Arial", 7))
+
+        # Special ("Sposi") table
+        sx, sy = self.model.table_positions.get(SPECIAL_TABLE, (1.2, ROOM_H / 2))
+        spx, spy = self.m2px_pos(sx, sy)
+        c.create_rectangle(
+            spx - SPECIAL_W_PX / 2, spy - SPECIAL_H_PX / 2,
+            spx + SPECIAL_W_PX / 2, spy + SPECIAL_H_PX / 2,
+            outline="#f5d76e", width=2
+        )
+        c.create_text(spx, spy, text=SPECIAL_TABLE, fill="#ffffff", font=("Arial", 9, "bold"))
+
+        # Round guest tables at their current (live) positions
+        clearance_r_px = self.m2px(Config.TABLE_CLEARANCE_DIAMETER_MM / 2000.0)
+        table_r_px = self.m2px(Config.TABLE_TOP_DIAMETER_MM / 2000.0)
+        table_items = [
+            (t, self.model.table_positions[t])
+            for t in self.model.tables
+            if t != SPECIAL_TABLE and t in self.model.table_positions
+        ]
+        for t, (x_m, y_m) in table_items:
+            px, py = self.m2px_pos(x_m, y_m)
+            c.create_oval(px - clearance_r_px, py - clearance_r_px,
+                          px + clearance_r_px, py + clearance_r_px,
+                          outline="#888888", dash=(4, 3))
+            c.create_oval(px - table_r_px, py - table_r_px,
+                          px + table_r_px, py + table_r_px,
+                          outline="#ffffff", width=2)
+            c.create_text(px, py, text=t, fill="#ffffff", font=("Arial", 8, "bold"))
+            c.create_text(
+                px, py + clearance_r_px + 10,
+                text=f"⌀{Config.TABLE_TOP_DIAMETER_MM}/{Config.TABLE_CLEARANCE_DIAMETER_MM} mm",
+                fill="#66ccff", font=("Arial", 7)
+            )
+
+        if self.show_all_var.get():
+            self._draw_all_measurements(table_items)
+        else:
+            self._draw_nearest_neighbor(table_items)
+        c.configure(scrollregion=c.bbox("all"))
+
+# ======================================================
 # Main App
 # ======================================================
 
@@ -1371,8 +1816,15 @@ class App(tk.Tk):
         planner_frame.rowconfigure(0, weight=1)
         planner_frame.columnconfigure(0, weight=1)
         viewer = ViewerTab(tabs)
+        self.technical_tab = TechnicalTab(tabs, self.model)
+        # Keep the read-only Technical Layout tab in sync with the Planner:
+        # it redraws every time the Planner canvas redraws (search, reset,
+        # editor save) and, importantly, right after a table is dragged.
+        self.canvas.on_change_callbacks.append(self.technical_tab.refresh)
         tabs.add(planner_frame, text="Planner")
         tabs.add(viewer, text="Viewer")
+        tabs.add(self.technical_tab, text="Technical Layout")
+        tabs.bind("<<NotebookTabChanged>>", lambda e: self.technical_tab.refresh())
 
     def on_search_change(self, *args):
         self.canvas.search_string = self.search_var.get().strip()
