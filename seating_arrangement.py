@@ -37,6 +37,7 @@ class Config:
     MIN_ALPHA: float = 0.25
     MAX_ALPHA: float = 1.00
     DEFAULT_FOOD_ALLERGY: str = "none"
+    DEFAULT_FOOD_PREFERENCE: str = "none"
     DEFAULT_PLUS_ONE_NAME: str = "+1"
 
 ROOM_L = Config.ROOM_L
@@ -76,6 +77,14 @@ def normalize_food_allergy_value(raw_value) -> str:
     return value or default_value
 
 
+def normalize_food_preference_value(raw_value) -> str:
+    """Return a canonical food preference string."""
+    if raw_value is None:
+        return Config.DEFAULT_FOOD_PREFERENCE
+    value = str(raw_value).strip()
+    return value or Config.DEFAULT_FOOD_PREFERENCE
+
+
 def normalize_plus_one(attendee: dict) -> list:
     """Normalize plus-one details into a list of guest objects."""
     raw_plus_one = attendee.get("plus_one", [])
@@ -102,14 +111,17 @@ def normalize_plus_one(attendee: dict) -> list:
         if isinstance(item, dict):
             name = str(item.get("name", Config.DEFAULT_PLUS_ONE_NAME)).strip() or Config.DEFAULT_PLUS_ONE_NAME
             allergy = normalize_food_allergy_value(item.get("food_allergy", Config.DEFAULT_FOOD_ALLERGY))
+            preference = normalize_food_preference_value(item.get("food_preference", Config.DEFAULT_FOOD_PREFERENCE))
             pid = item.get("_id") or uuid.uuid4().hex
         else:
             name = Config.DEFAULT_PLUS_ONE_NAME
             allergy = Config.DEFAULT_FOOD_ALLERGY
+            preference = Config.DEFAULT_FOOD_PREFERENCE
             pid = uuid.uuid4().hex
         normalized.append({
             "name": name,
             "food_allergy": allergy,
+            "food_preference": preference,
             "_id": pid,
             "side": attendee.get("side", ""),
             "category": attendee.get("category", 6),
@@ -128,6 +140,14 @@ def normalize_food_allergy(attendee: dict) -> str:
     if "food_allergy_override" in attendee:
         del attendee["food_allergy_override"]
     return attendee["food_allergy"]
+
+
+def normalize_food_preference(attendee: dict) -> str:
+    """Normalize attendee food preference to a canonical scalar string."""
+    attendee["food_preference"] = normalize_food_preference_value(
+        attendee.get("food_preference", Config.DEFAULT_FOOD_PREFERENCE)
+    )
+    return attendee["food_preference"]
 
 
 def attendee_headcount(attendee: dict) -> int:
@@ -182,10 +202,19 @@ class SeatingModel:
     def __init__(self):
         self.tables = {}
         self.table_positions = {}
+        self.legend_positions = {}
 
     def table_headcount(self, guests: list) -> int:
         """Return total seats consumed at a table including +1 seats."""
         return sum(attendee_headcount(g) for g in guests)
+
+    def total_invitees(self) -> int:
+        """Return the number of main invitees, excluding plus-ones."""
+        return sum(len(guests) for guests in self.tables.values())
+
+    def total_headcount(self) -> int:
+        """Return the number of invitees including plus-one seats."""
+        return sum(self.table_headcount(guests) for guests in self.tables.values())
 
     def split_group_by_capacity(self, attendees: list, max_heads: int) -> list:
         """Split attendees into sequential chunks that fit table headcount capacity."""
@@ -256,10 +285,14 @@ class SeatingModel:
             with open(path, "r", encoding="utf-8") as f:
                 raw = json.load(f)
             self.table_positions = raw.pop("_table_positions", {})
+            self.legend_positions = raw.pop("_legend_positions", {})
             self.tables = raw
             for k, v in list(self.table_positions.items()):
                 if isinstance(v, list) and len(v) == 2:
                     self.table_positions[k] = (float(v[0]), float(v[1]))
+            for k, v in list(self.legend_positions.items()):
+                if isinstance(v, list) and len(v) == 2:
+                    self.legend_positions[k] = (float(v[0]), float(v[1]))
             self._normalize_all_attendees()
             self._ensure_special_table_position()
             self._ensure_non_special_tables_below_special()
@@ -279,6 +312,7 @@ class SeatingModel:
     def save_json(self, path="seating_arrangement.json"):
         data = dict(self.tables)
         data["_table_positions"] = {k: [float(x), float(y)] for k, (x, y) in self.table_positions.items()}
+        data["_legend_positions"] = {k: [float(x), float(y)] for k, (x, y) in self.legend_positions.items()}
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
 
@@ -298,6 +332,67 @@ class SeatingModel:
                 ])
         atomic_write_csv(path, rows)
 
+    def save_pdf(self, path="seating_arrangement.pdf"):
+        """Export invitees and their food requirements to a PDF report."""
+        try:
+            from reportlab.lib import colors
+            from reportlab.lib.pagesizes import landscape, A4
+            from reportlab.lib.styles import getSampleStyleSheet
+            from reportlab.lib.units import mm
+            from reportlab.platypus import SimpleDocTemplate, Spacer, Table, TableStyle, Paragraph
+        except ImportError as exc:
+            raise RuntimeError("PDF export requires the reportlab package.") from exc
+
+        styles = getSampleStyleSheet()
+        body_style = styles["BodyText"]
+        body_style.fontSize = 8
+        body_style.leading = 10
+        rows = [["Table", "Guest", "Food allergy", "Food preference"]]
+        for table, guests in self.tables.items():
+            for guest in guests:
+                rows.append([
+                    table,
+                    guest.get("name", ""),
+                    effective_food_allergy(guest),
+                    normalize_food_preference(guest),
+                ])
+                for plus_one in normalize_plus_one(guest):
+                    rows.append([
+                        table,
+                        plus_one.get("name", Config.DEFAULT_PLUS_ONE_NAME),
+                        plus_one.get("food_allergy", Config.DEFAULT_FOOD_ALLERGY),
+                        plus_one.get("food_preference", Config.DEFAULT_FOOD_PREFERENCE),
+                    ])
+
+        pdf = SimpleDocTemplate(
+            path,
+            pagesize=landscape(A4),
+            rightMargin=12 * mm,
+            leftMargin=12 * mm,
+            topMargin=12 * mm,
+            bottomMargin=12 * mm,
+        )
+        table = Table(
+            [[Paragraph(str(value), body_style) for value in row] for row in rows],
+            repeatRows=1,
+            colWidths=[32 * mm, 65 * mm, 78 * mm, 95 * mm],
+        )
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#333333")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#eeeeee")]),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        pdf.build([
+            Paragraph("Wedding Seating Food Requirements", styles["Title"]),
+            Spacer(1, 6 * mm),
+            table,
+        ])
+
     def _normalize_all_attendees(self):
         attendees = [a for guests in self.tables.values() for a in guests]
         if not attendees:
@@ -310,9 +405,11 @@ class SeatingModel:
             a.setdefault("relationship", "Colleagues")
             a.setdefault("plus_one", [])
             a.setdefault("food_allergy", Config.DEFAULT_FOOD_ALLERGY)
+            a.setdefault("food_preference", Config.DEFAULT_FOOD_PREFERENCE)
             ensure_attendee_id(a)
             normalize_plus_one(a)
             normalize_food_allergy(a)
+            normalize_food_preference(a)
         bride = next((a for a in attendees if a.get("relationship") == "Bride"), None)
         groom = next((a for a in attendees if a.get("relationship") == "Groom"), None)
         pool = [a for a in attendees if a not in (bride, groom)]
@@ -381,6 +478,7 @@ class SeatingModel:
             ensure_attendee_id(a)
             normalize_plus_one(a)
             normalize_food_allergy(a)
+            normalize_food_preference(a)
         # Find bride and groom based on category 1
         category_1_attendees = [a for a in raw if a.get("category") == 1]
         if len(category_1_attendees) < 2:
@@ -398,6 +496,7 @@ class SeatingModel:
             a["category"] = 1 if a["relationship"] in ("Bride", "Groom") else RELATIONSHIPS.index(a["relationship"])
             normalize_plus_one(a)
             normalize_food_allergy(a)
+            normalize_food_preference(a)
         # Group by relationship (except Bride/Groom)
         groups = {}
         for a in raw:
@@ -473,7 +572,7 @@ class PlannerCanvas(tk.Canvas):
         self.drag = None
         self.attendee_items = {}
         self.search_string = ""
-        self.legend_positions = {}  # table -> (x, y)
+        self.legend_positions = model.legend_positions
         self.draw()
 
     def m2px(self, v):
@@ -485,6 +584,9 @@ class PlannerCanvas(tk.Canvas):
             for guest in guests:
                 if guest.get("_id") == attendee_id:
                     return table_name, guest
+                for plus_one in guest.get("plus_one", []):
+                    if plus_one.get("_id") == attendee_id:
+                        return table_name, plus_one
         return None, None
 
     def _open_attendee_editor(self, attendee_id: str):
@@ -495,6 +597,7 @@ class PlannerCanvas(tk.Canvas):
             return
 
         normalize_food_allergy(attendee)
+        normalize_food_preference(attendee)
         normalize_plus_one(attendee)
 
         popup = tk.Toplevel(self)
@@ -519,17 +622,28 @@ class PlannerCanvas(tk.Canvas):
             row=1, column=1, columnspan=2, sticky="ew", padx=(6, 0)
         )
 
-        ttk.Label(frame, text="Plus-ones").grid(row=2, column=0, sticky="w", pady=(10, 4))
-        plus_list = tk.Listbox(frame, height=6, width=48)
-        plus_list.grid(row=3, column=0, columnspan=3, sticky="ew")
+        ttk.Label(frame, text="Food preference:").grid(row=2, column=0, sticky="w")
+        attendee_preference_var = tk.StringVar(
+            value=attendee.get("food_preference", Config.DEFAULT_FOOD_PREFERENCE)
+        )
+        ttk.Entry(frame, textvariable=attendee_preference_var, width=30).grid(
+            row=2, column=1, columnspan=2, sticky="ew", padx=(6, 0)
+        )
 
-        ttk.Label(frame, text="Name").grid(row=4, column=0, sticky="w", pady=(8, 0))
-        ttk.Label(frame, text="Food allergy").grid(row=4, column=1, sticky="w", pady=(8, 0))
+        ttk.Label(frame, text="Plus-ones").grid(row=3, column=0, sticky="w", pady=(10, 4))
+        plus_list = tk.Listbox(frame, height=6, width=48)
+        plus_list.grid(row=4, column=0, columnspan=3, sticky="ew")
+
+        ttk.Label(frame, text="Name").grid(row=5, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(frame, text="Food allergy").grid(row=5, column=1, sticky="w", pady=(8, 0))
+        ttk.Label(frame, text="Food preference").grid(row=5, column=2, sticky="w", pady=(8, 0))
 
         plus_name_var = tk.StringVar(value=Config.DEFAULT_PLUS_ONE_NAME)
         plus_food_var = tk.StringVar(value=Config.DEFAULT_FOOD_ALLERGY)
-        ttk.Entry(frame, textvariable=plus_name_var, width=20).grid(row=5, column=0, sticky="ew", padx=(0, 6))
-        ttk.Entry(frame, textvariable=plus_food_var, width=20).grid(row=5, column=1, sticky="ew", padx=(0, 6))
+        plus_preference_var = tk.StringVar(value=Config.DEFAULT_FOOD_PREFERENCE)
+        ttk.Entry(frame, textvariable=plus_name_var, width=20).grid(row=6, column=0, sticky="ew", padx=(0, 6))
+        ttk.Entry(frame, textvariable=plus_food_var, width=20).grid(row=6, column=1, sticky="ew", padx=(0, 6))
+        ttk.Entry(frame, textvariable=plus_preference_var, width=20).grid(row=6, column=2, sticky="ew")
 
         working_plus_ones = [dict(p) for p in attendee.get("plus_one", [])]
 
@@ -538,7 +652,9 @@ class PlannerCanvas(tk.Canvas):
             for index, plus_one in enumerate(working_plus_ones, start=1):
                 plus_list.insert(
                     tk.END,
-                    f"{index}. {plus_one.get('name', Config.DEFAULT_PLUS_ONE_NAME)} | {plus_one.get('food_allergy', Config.DEFAULT_FOOD_ALLERGY)}"
+                    f"{index}. {plus_one.get('name', Config.DEFAULT_PLUS_ONE_NAME)} | "
+                    f"{plus_one.get('food_allergy', Config.DEFAULT_FOOD_ALLERGY)} | "
+                    f"{plus_one.get('food_preference', Config.DEFAULT_FOOD_PREFERENCE)}"
                 )
 
         def selected_index():
@@ -552,11 +668,13 @@ class PlannerCanvas(tk.Canvas):
             item = working_plus_ones[idx]
             plus_name_var.set(item.get("name", Config.DEFAULT_PLUS_ONE_NAME))
             plus_food_var.set(item.get("food_allergy", Config.DEFAULT_FOOD_ALLERGY))
+            plus_preference_var.set(item.get("food_preference", Config.DEFAULT_FOOD_PREFERENCE))
 
         def add_or_update_plus_one():
             plus_one_item = {
                 "name": plus_name_var.get().strip() or Config.DEFAULT_PLUS_ONE_NAME,
                 "food_allergy": plus_food_var.get().strip() or Config.DEFAULT_FOOD_ALLERGY,
+                "food_preference": plus_preference_var.get().strip() or Config.DEFAULT_FOOD_PREFERENCE,
             }
             idx = selected_index()
             if idx is None:
@@ -573,9 +691,10 @@ class PlannerCanvas(tk.Canvas):
             refresh_plus_ones()
             plus_name_var.set(Config.DEFAULT_PLUS_ONE_NAME)
             plus_food_var.set(Config.DEFAULT_FOOD_ALLERGY)
+            plus_preference_var.set(Config.DEFAULT_FOOD_PREFERENCE)
 
         button_frame = ttk.Frame(frame)
-        button_frame.grid(row=5, column=2, sticky="e")
+        button_frame.grid(row=7, column=0, columnspan=3, sticky="e", pady=(6, 0))
         ttk.Button(button_frame, text="Add/Update", command=add_or_update_plus_one).pack(side="left", padx=(0, 6))
         ttk.Button(button_frame, text="Remove", command=remove_plus_one).pack(side="left")
 
@@ -583,15 +702,19 @@ class PlannerCanvas(tk.Canvas):
 
         def save_changes():
             original_allergy = attendee.get("food_allergy", Config.DEFAULT_FOOD_ALLERGY)
+            original_preference = attendee.get("food_preference", Config.DEFAULT_FOOD_PREFERENCE)
             original_plus_one = [dict(p) for p in attendee.get("plus_one", [])]
 
             attendee["food_allergy"] = attendee_allergy_var.get().strip() or Config.DEFAULT_FOOD_ALLERGY
+            attendee["food_preference"] = attendee_preference_var.get().strip() or Config.DEFAULT_FOOD_PREFERENCE
             attendee["plus_one"] = working_plus_ones[:max(0, Config.SEATS_PER_TABLE - 1)]
             normalize_food_allergy(attendee)
+            normalize_food_preference(attendee)
             normalize_plus_one(attendee)
 
             if table_name != SPECIAL_TABLE and self.model.table_headcount(self.model.tables.get(table_name, [])) > SEATS_PER_TABLE:
                 attendee["food_allergy"] = original_allergy
+                attendee["food_preference"] = original_preference
                 attendee["plus_one"] = original_plus_one
                 messagebox.showwarning(
                     "Table Capacity",
@@ -603,7 +726,7 @@ class PlannerCanvas(tk.Canvas):
             self.draw()
 
         actions = ttk.Frame(frame)
-        actions.grid(row=6, column=0, columnspan=3, sticky="e", pady=(12, 0))
+        actions.grid(row=8, column=0, columnspan=3, sticky="e", pady=(12, 0))
         ttk.Button(actions, text="Cancel", command=popup.destroy).pack(side="right")
         ttk.Button(actions, text="Save", command=save_changes).pack(side="right", padx=(0, 6))
 
@@ -688,18 +811,28 @@ class PlannerCanvas(tk.Canvas):
     def draw(self):
         self.delete("all")
         self.attendee_items.clear()
+        self.winfo_toplevel().title(
+            f"Wedding Seating Planner - Invitees: {self.model.total_invitees()} "
+            f"(including +1s: {self.model.total_headcount()})"
+        )
         self.create_rectangle(
             5, 5, CANVAS_W - 5, CANVAS_H - 5,
             outline="#333333", width=2
         )
         legend_x = 12
         legend_y = 12
-        legend_w = 220
+        legend_w = 460
         line_h = 18
         legend_bg = "#111111"
         legend_border = "#333333"
         total_lines = 1 + sum(1 + min(len(guests), 8) for guests in self.model.tables.values())
-        legend_height = legend_y - 16 + total_lines * line_h + 6
+        legend_tables = list(self.model.tables.keys())
+        legend_rows = []
+        for row_index in range((len(legend_tables) + 1) // 2):
+            row_tables = legend_tables[row_index * 2:row_index * 2 + 2]
+            row_lines = max(1 + min(len(self.model.tables[table]), 8) for table in row_tables)
+            legend_rows.append(row_lines)
+        legend_height = legend_y - 16 + line_h + sum(row_lines * line_h + 6 for row_lines in legend_rows) + 6
         self.create_rectangle(
             legend_x - 16, legend_y - 16,
             legend_x + legend_w, legend_height,
@@ -707,11 +840,11 @@ class PlannerCanvas(tk.Canvas):
         )
         self.create_text(legend_x, legend_y - 2, text="Legend (by table colors)",
                           fill="#ffffff", font=("Arial", 10, "bold"), anchor="nw")
-        sorted_tables = sorted(self.model.tables.keys())
-        for idx, table in enumerate(sorted_tables):
+        for idx, table in enumerate(legend_tables):
             guests = self.model.tables.get(table, [])
-            default_x = legend_x
-            default_y = legend_y + (idx*5 + 1) * line_h
+            row_index, column_index = divmod(idx, 2)
+            default_x = legend_x + column_index * 230
+            default_y = legend_y + line_h + sum(row_lines * line_h + 6 for row_lines in legend_rows[:row_index])
             base_x, base_y = self.legend_positions.get(table, (default_x, default_y))
             rep = guests[0] if guests else None
             header_color = self.attendee_color(rep) if rep else "#666666"
@@ -868,6 +1001,7 @@ class PlannerCanvas(tk.Canvas):
                         width=1,
                         tags=(group_tag, f"attendee:{pid}", "attendee", "plusone")
                     )
+                    self.tag_bind(f"attendee:{pid}", "<Double-Button-3>", self.open_attendee_editor_from_event)
                     
                     
                     """pid = ensure_attendee_id(p)
@@ -905,7 +1039,7 @@ class PlannerCanvas(tk.Canvas):
                 self.tag_bind(f"attendee:{aid}", "<B1-Motion>", self.drag_attendee)
                 self.tag_bind(f"attendee:{aid}", "<ButtonRelease-1>",
                               lambda e, a=g, attendee_id=aid: self.end_attendee_drag(e, a, attendee_id))
-                self.tag_bind(f"attendee:{aid}", "<Button-3>", self.open_attendee_editor_from_event)
+                self.tag_bind(f"attendee:{aid}", "<Double-Button-3>", self.open_attendee_editor_from_event)
         self.configure(scrollregion=self.bbox("all"))
 
     def start_table_drag(self, e, table):
@@ -1054,7 +1188,7 @@ class PlannerCanvas(tk.Canvas):
         x = self.canvasx(e.x)
         y = self.canvasy(e.y)
         # Update position
-        self.legend_positions[table] = (x - 7, y - 7)  # Adjust for the rect center
+        self.model.legend_positions[table] = (x - 7, y - 7)  # Adjust for the rect center
         self.drag = None
         return "break"
 
@@ -1221,6 +1355,7 @@ class App(tk.Tk):
         self.search_entry = ttk.Entry(top, textvariable=self.search_var, width=20)
         self.search_entry.pack(side="left", padx=8, pady=8)
         self.search_var.trace("w", self.on_search_change)
+        ttk.Button(top, text="Export PDF", command=self.export_pdf).pack(side="right", padx=8, pady=8)
         ttk.Button(top, text="Reset Layout", command=self.on_reset).pack(side="right", padx=8, pady=8)
         tabs = ttk.Notebook(self)
         tabs.pack(fill="both", expand=True)
@@ -1247,6 +1382,21 @@ class App(tk.Tk):
         self.model.reset_layout()
         self.model.enforce_table_capacity()
         self.canvas.draw()
+
+    def export_pdf(self):
+        path = filedialog.asksaveasfilename(
+            defaultextension=".pdf",
+            filetypes=[("PDF files", "*.pdf")],
+            initialfile="seating_arrangement.pdf",
+        )
+        if not path:
+            return
+        try:
+            self.model.save_pdf(path)
+        except Exception as exc:
+            messagebox.showerror("PDF export error", f"Failed to export PDF:\n{exc}")
+            return
+        messagebox.showinfo("PDF exported", f"PDF saved to:\n{path}")
 
     def on_close(self):
         self.model.save_json("seating_arrangement.json")
