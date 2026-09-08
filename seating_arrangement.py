@@ -9,6 +9,13 @@ import os
 import random
 import logging
 
+# Rasterization multiplier used only for the PostScript-based screenshot
+# fallback in App._capture_widget_image (see there for why). Higher = more
+# legible text/lines in the exported PDF's UI-image pages, at the cost of a
+# slower conversion and a larger PDF. 3 is a reasonable default; raise it if
+# the fallback images still look blurry once printed.
+PDF_SCREENSHOT_SCALE: int = 3
+
 # ======================================================
 # Configuration
 # ======================================================
@@ -429,7 +436,7 @@ class SeatingModel:
         body_style = styles["BodyText"]
         body_style.fontSize = 8
         body_style.leading = 10
-        rows = [["Table", "Guest", "Food allergy", "Food preference"]]
+        rows = [["Tavolo", "Ospiti", "Allergia alimentare", "Preferenza alimentare"]]
         for table, guests in self.tables.items():
             for guest in guests:
                 rows.append([
@@ -913,22 +920,30 @@ class PlannerCanvas(tk.Canvas):
         rgb = blend_rgb(CANVAS_BG_RGB, fg, alpha)
         return rgb_to_hex(rgb)
 
-    def draw_highlighted_text(self, x, y, text, font, fill, highlight_fill, tags):
-        """Draw text with highlighting for search string. Returns list of text ids."""
+    def draw_highlighted_text(self, x, y, text, font, fill, highlight_fill, tags, anchor="w"):
+        """Draw text with highlighting for search string. Returns list of text ids.
+
+        anchor: passed straight to create_text for the common (no active
+        search match) case, so a caller can anchor a label on either side
+        of its point -- e.g. attendee names radiating outward from a table
+        need "w" on the right side of the table and "e" on the left, so the
+        text extends away from the table instead of overlapping it.
+        """
         ids = []
         if not self.search_string:
-            id_ = self.create_text(x, y, text=text, fill=fill, font=font, tags=tags, anchor="w")
+            id_ = self.create_text(x, y, text=text, fill=fill, font=font, tags=tags, anchor=anchor)
             ids.append(id_)
             return ids
         search_lower = self.search_string.lower()
         text_lower = text.lower()
         start = text_lower.find(search_lower)
         if start == -1:
-            id_ = self.create_text(x, y, text=text, fill=fill, font=font, tags=tags, anchor="w")
+            id_ = self.create_text(x, y, text=text, fill=fill, font=font, tags=tags, anchor=anchor)
             ids.append(id_)
             return ids
         end = start + len(self.search_string)
-        # Draw parts
+        # Draw parts (highlighted-run splitting always lays out left-to-right,
+        # so it keeps the "w" convention regardless of the requested anchor).
         current_x = x
         # Before match
         if start > 0:
@@ -997,7 +1012,8 @@ class PlannerCanvas(tk.Canvas):
         legend_x, legend_y = self.model.legend_origin
         legend_col_w = 230
         legend_w = legend_col_w * 2
-        line_h = 18
+        line_h = 20  # per-table-block vertical budget (kept above LEGEND_LINE_STEP + margin)
+        LEGEND_LINE_STEP = 16  # vertical distance between consecutive name rows in a block
         legend_bg = "#111111"
         legend_border = "#333333"
 
@@ -1062,17 +1078,17 @@ class PlannerCanvas(tk.Canvas):
             line_offset = 0
             for j, a in enumerate(guests[:8]):
                 c = self.attendee_color(a)
-                y = base_y + 16 + line_offset * 14
+                y = base_y + 16 + line_offset * LEGEND_LINE_STEP
                 oval_id = self.create_rectangle(
                     base_x + 22, y - 2,
-                    base_x + 34, y + 10,
+                    base_x + 34, y + 12,
                     fill=c, outline="#ffffff", width=1,
                     tags=(f"legend_group:{table}", f"legend_attendee:{table}:{ensure_attendee_id(a)}") + panel_tags
                 )
                 self.create_text(
-                    base_x + 40, y + 4,
+                    base_x + 40, y + 5,
                     text=a.get("name", ""),
-                    fill="#ffffff", font=("Arial", 7), anchor="w",
+                    fill="#ffffff", font=("Arial", 8), anchor="w",
                     tags=(f"legend_group:{table}",) + panel_tags
                 )
                 # Bind drag for legend attendee
@@ -1085,18 +1101,18 @@ class PlannerCanvas(tk.Canvas):
                 # invitee, in the same style (color swatch + name) -- just
                 # display-only, no drag/reassign binding on these rows.
                 for p in a.get("plus_one", []):
-                    py_line = base_y + 16 + line_offset * 14
+                    py_line = base_y + 16 + line_offset * LEGEND_LINE_STEP
                     pc = self.attendee_color(p)
                     self.create_rectangle(
                         base_x + 22, py_line - 2,
-                        base_x + 34, py_line + 10,
+                        base_x + 34, py_line + 12,
                         fill=pc, outline="#ffffff", width=1,
                         tags=(f"legend_group:{table}",) + panel_tags
                     )
                     self.create_text(
-                        base_x + 40, py_line + 4,
+                        base_x + 40, py_line + 5,
                         text=p.get("name", ""),
-                        fill="#ffffff", font=("Arial", 7), anchor="w",
+                        fill="#ffffff", font=("Arial", 8), anchor="w",
                         tags=(f"legend_group:{table}",) + panel_tags
                     )
                     line_offset += 1
@@ -1207,14 +1223,27 @@ class PlannerCanvas(tk.Canvas):
                     fill=color, outline="#ffffff", width=1,
                     tags=(group_tag, f"attendee:{aid}", "attendee")
                 )
+                # Place the name label out along the same radial direction as
+                # the seat itself (rather than always straight below the
+                # dot), anchored so the text extends AWAY from the table --
+                # "w" (grows rightward) on the table's right side, "e"
+                # (grows leftward) on its left side. Alternating the radial
+                # distance by seat index staggers neighboring labels onto
+                # two different "rings" so they don't collide even when
+                # several seats are packed close together around the table.
+                label_dist = ATT_R_PX + (4 if i % 2 == 0 else 13)
+                label_x = gx + math.cos(ang) * label_dist
+                label_y = gy + math.sin(ang) * label_dist
+                label_anchor = "w" if math.cos(ang) >= 0 else "e"
                 text_ids = self.draw_highlighted_text(
-                    gx-len(aid)/2, gy + 18,
+                    label_x, label_y,
                     g.get("name", "").split(" ", 1)[0],
                     #g.get("name", ""),
-                    ("Arial", 8),
+                    ("Arial", 10, "bold"),
                     "#ffffff",
                     "#ffff00",
-                    (group_tag, f"attendee:{aid}", "attendee_label")
+                    (group_tag, f"attendee:{aid}", "attendee_label"),
+                    anchor=label_anchor,
                 )
                 self.attendee_items[aid] = (oval_id, text_ids)
                 # Draw plus-ones for this main invitee
@@ -1919,23 +1948,94 @@ class App(tk.Tk):
         self.canvas.draw()
 
     def _capture_widget_image(self, widget):
-        """Capture the given widget's contents as PNG bytes.
+        """Capture the given widget's FULL contents as PNG bytes.
 
-        Two strategies are tried, in order:
-          1. An OS-level screen grab (PIL.ImageGrab) -- best fidelity, but
-             needs a real, directly-accessible display and can fail under
-             some X11/WSL setups (e.g. remote/forwarded displays that
-             refuse the low-level XGetImage screen-capture call).
-          2. For a Canvas widget, Tk's own PostScript export -- rendered
-             from the canvas's draw list rather than the screen, so it
-             works regardless of the display setup, at the cost of needing
-             Ghostscript installed to rasterize the PostScript to PNG.
-        Returns None (never raises) if neither works, so PDF export still
-        succeeds -- just without that particular UI-image page.
+        For a Canvas (both the Planner and Technical Layout views are plain
+        tk.Canvas widgets), this always renders Tk's own PostScript export
+        of the canvas rather than grabbing the screen. That matters for two
+        reasons: (1) it's generated from the canvas's complete draw list,
+        so it captures the entire drawing -- including anything that only
+        fits by scrolling -- rather than whatever happens to be visible in
+        the current window size, which is what was cutting content off
+        before; (2) it works regardless of the display setup, since it
+        never touches the OS screen at all (some remote/forwarded X11
+        setups, e.g. under WSL, refuse the low-level screen-capture call).
+        Requires Ghostscript on PATH to rasterize the PostScript to PNG.
+
+        Any other widget type falls back to an OS-level screen grab
+        (PIL.ImageGrab) of its visible on-screen area.
+
+        Returns None (never raises) if capture isn't possible, so PDF
+        export still succeeds -- just without that particular image page.
         """
         self.update_idletasks()
         self.update()
 
+        if isinstance(widget, tk.Canvas):
+            bg_item = None
+            try:
+                from PIL import Image
+                # Export the full drawing extent (the bounding box of every
+                # item ever placed on the canvas, which is exactly what its
+                # scrollregion is set to -- see draw()'s
+                # `self.configure(scrollregion=self.bbox("all"))`), not just
+                # whatever fits in the currently visible viewport.
+                bbox = widget.bbox("all")
+                if bbox:
+                    x0, y0, x1, y1 = bbox
+                else:
+                    x0, y0 = 0, 0
+                    x1, y1 = widget.winfo_width(), widget.winfo_height()
+                content_w = max(1, x1 - x0)
+                content_h = max(1, y1 - y0)
+
+                # canvas.postscript() only renders explicit canvas items --
+                # it does NOT paint the widget's own `bg` fill, so the
+                # exported page defaults to plain white. Since this app's
+                # canvases use a dark background with light/white text and
+                # lines, that swallows most of the content (e.g. white guest
+                # names become invisible). Draw a temporary rectangle
+                # spanning the full exported area in the widget's real
+                # background color, send it behind everything else, export,
+                # then remove it so live drawing is unaffected.
+                bg_color = widget.cget("bg") or "#000000"
+                bg_item = widget.create_rectangle(
+                    x0, y0, x1, y1, fill=bg_color, outline=bg_color
+                )
+                widget.tag_lower(bg_item)
+                ps = widget.postscript(
+                    colormode="color", x=x0, y=y0, width=content_w, height=content_h
+                )
+                img = Image.open(io.BytesIO(ps.encode("utf-8")))
+                # The default EPS rasterization is 1 pixel per PostScript
+                # point (~72 dpi), which looks blurry once printed -- text
+                # and thin table/room lines turn illegible. Pillow's
+                # EpsImagePlugin can re-rasterize at an integer multiple of
+                # that via `scale`; render several times larger, then embed
+                # at the original on-screen size in the PDF for crisp text.
+                try:
+                    img.load(scale=PDF_SCREENSHOT_SCALE)
+                except TypeError:
+                    img.load()
+                buf = io.BytesIO()
+                img.convert("RGB").save(buf, format="PNG")
+                return buf.getvalue()
+            except Exception:
+                logging.exception(
+                    "Canvas PostScript export failed for PDF export screenshot "
+                    "(this fallback needs Ghostscript installed on PATH)."
+                )
+                return None
+            finally:
+                if bg_item is not None:
+                    try:
+                        widget.delete(bg_item)
+                    except Exception:
+                        pass
+
+        # Non-Canvas widgets (not currently used by the Planner/Technical
+        # captures, kept for completeness): fall back to a screen grab of
+        # the visible on-screen area.
         try:
             from PIL import ImageGrab
             x = widget.winfo_rootx()
@@ -1948,26 +2048,7 @@ class App(tk.Tk):
                 img.save(buf, format="PNG")
                 return buf.getvalue()
         except Exception:
-            logging.info(
-                "Screen grab unavailable for PDF export screenshot; "
-                "trying the canvas's own PostScript export instead.",
-                exc_info=True,
-            )
-
-        if isinstance(widget, tk.Canvas):
-            try:
-                from PIL import Image
-                ps = widget.postscript(colormode="color")
-                img = Image.open(io.BytesIO(ps.encode("utf-8")))
-                img.load()
-                buf = io.BytesIO()
-                img.convert("RGB").save(buf, format="PNG")
-                return buf.getvalue()
-            except Exception:
-                logging.exception(
-                    "Canvas PostScript export also failed for PDF export screenshot "
-                    "(this fallback needs Ghostscript installed on PATH)."
-                )
+            logging.exception("Screen grab failed for PDF export screenshot")
 
         return None
 
@@ -1997,7 +2078,19 @@ class App(tk.Tk):
 
             self.tabs.select(self.technical_tab)
             self.lift()
-            technical_shot = self._capture_widget_image(self.technical_tab.canvas)
+            # The exported Technical Layout page should always show the
+            # full distance/size measurements, regardless of whatever the
+            # "show distance to closest table" toggle is currently set to
+            # on screen -- so force it on for the capture, then restore
+            # whatever the user had it set to.
+            prev_show_all = self.technical_tab.show_all_var.get()
+            self.technical_tab.show_all_var.set(True)
+            self.technical_tab.refresh()
+            try:
+                technical_shot = self._capture_widget_image(self.technical_tab.canvas)
+            finally:
+                self.technical_tab.show_all_var.set(prev_show_all)
+                self.technical_tab.refresh()
             if technical_shot:
                 extra_images.append(("Technical Layout", technical_shot))
         except Exception:
