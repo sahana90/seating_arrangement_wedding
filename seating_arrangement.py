@@ -432,25 +432,37 @@ class SeatingModel:
         except ImportError as exc:
             raise RuntimeError("PDF export requires the reportlab package.") from exc
 
+        def cell(value):
+            """PDF cell text: blank rather than the word "none"/"None" --
+            Python's None, or this app's own "nothing entered" placeholder
+            (Config.DEFAULT_FOOD_ALLERGY/PREFERENCE, both "none") -- when
+            nothing was actually filled in. An empty cell reads more
+            clearly on a printed report than filler text.
+            """
+            if value is None:
+                return ""
+            text = str(value).strip()
+            return "" if text.lower() == "none" else text
+
         styles = getSampleStyleSheet()
         body_style = styles["BodyText"]
         body_style.fontSize = 8
         body_style.leading = 10
-        rows = [["Tavolo", "Ospiti", "Allergia alimentare", "Preferenza alimentare"]]
+        rows = [["Table", "Guest", "Food allergy", "Food preference"]]
         for table, guests in self.tables.items():
             for guest in guests:
                 rows.append([
-                    table,
-                    guest.get("name", ""),
-                    effective_food_allergy(guest),
-                    normalize_food_preference(guest),
+                    cell(table),
+                    cell(guest.get("name", "")),
+                    cell(effective_food_allergy(guest)),
+                    cell(normalize_food_preference(guest)),
                 ])
                 for plus_one in normalize_plus_one(guest):
                     rows.append([
-                        table,
-                        plus_one.get("name", Config.DEFAULT_PLUS_ONE_NAME),
-                        plus_one.get("food_allergy", Config.DEFAULT_FOOD_ALLERGY),
-                        plus_one.get("food_preference", Config.DEFAULT_FOOD_PREFERENCE),
+                        cell(table),
+                        cell(plus_one.get("name", Config.DEFAULT_PLUS_ONE_NAME)),
+                        cell(plus_one.get("food_allergy", Config.DEFAULT_FOOD_ALLERGY)),
+                        cell(plus_one.get("food_preference", Config.DEFAULT_FOOD_PREFERENCE)),
                     ])
 
         pdf = SimpleDocTemplate(
